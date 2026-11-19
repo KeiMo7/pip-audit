@@ -413,6 +413,38 @@ flask 0.5     PYSEC-2019-179 1.0          Successfully upgraded flask (0.5 => 1.
 flask 0.5     PYSEC-2018-66  0.12.3       Successfully upgraded flask (0.5 => 1.0)
 ```
 
+### Explainable, constraint-aware fix advice
+
+The plain `--fix` heuristic picks the first published fix point greater than
+the installed version. That choice is neither explained nor checked against
+the project's own manifest constraints. `pip-audit --fix --explain` replaces
+it with an explainable engine that, for every vulnerable dependency:
+
+* derives the **affected version range** offline from neighboring fix points
+  when the vulnerability source only provides "fixed at" versions;
+* chooses the **nearest fix point on the current maintenance branch**, never a
+  global minimum that would downgrade a newer release line, using PEP 440
+  ordering (pre-release and local version segments included);
+* merges multiple hits on one dependency into the minimum version that clears
+  all of them, and records every rejected candidate with its reason;
+* checks each candidate against the manifest (`requirements.txt` /
+  `pyproject.toml`) and reports a **constraint conflict** — naming the bound
+  that must be relaxed — instead of writing a version that cannot be installed;
+* refuses the whole batch and rolls the manifest back if the post-write
+  re-audit still reports any hit, so a completed run always re-audits clean.
+
+Each piece of advice is one of `fixed`, `upgrade`, `constraint-conflict` or
+`undeterminable`. With `--format json` the evidence is appended under a
+separate `fix_advice` key (the legacy `fixes` schema is unchanged), and the
+summary prints a classification tally:
+
+```console
+$ pip-audit --fix --explain --format json -r requirements.txt
+Fix advice classification: constraint-conflict=1, upgrade=2
+```
+
+Constraint conflicts and undeterminable entries never modify the manifest.
+
 ## Troubleshooting
 
 Have you resolved a problem with `pip-audit`? Help us by contributing to this

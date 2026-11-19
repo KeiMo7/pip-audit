@@ -23,8 +23,16 @@ from pip_audit._dependency_source import (
     PyProjectSource,
     RequirementSource,
 )
+from pip_audit._constraints import ConstraintSnapshotError
 from pip_audit._dependency_source.pylock import PyLockSource
-from pip_audit._fix import ResolvedFixVersion, SkippedFixVersion, resolve_fix_versions
+from pip_audit._fix import (
+    FixVersion,
+    ResolvedFixVersion,
+    SkippedFixVersion,
+    resolve_fix_versions,
+    resolve_fix_versions_explained,
+)
+from pip_audit._fix_advice import AdviceClassification, FixAdvice
 from pip_audit._format import (
     ColumnsFormat,
     CycloneDxFormat,
@@ -192,6 +200,90 @@ def _fatal(msg: str) -> NoReturn:  # pragma: no cover
     sys.exit(1)
 
 
+class FixVerificationError(Exception):
+    """
+    Raised when a post-fix re-audit still reports vulnerabilities.
+
+    The caller rolls back every manifest change made during the fix batch.
+    """
+
+    pass
+
+
+def _manifest_paths(source: DependencySource) -> list[Path]:
+    """
+    Return the on-disk manifest paths owned by a dependency source, if any.
+
+    Sources without a writable manifest (e.g. the live `pip` environment)
+    return an empty list; their verification relies solely on the engine's
+    pre-write service re-audit.
+    """
+    filenames = getattr(source, "_filenames", None)
+    if filenames is not None:
+        return [Path(f) for f in filenames]
+    filename = getattr(source, "filename", None)
+    if filename is not None:
+        return [Path(filename)]
+    return []
+
+
+def _snapshot_manifests(source: DependencySource) -> dict[Path, bytes]:
+    """
+    Capture the raw bytes of every manifest before a fix batch.
+    """
+    return {path: path.read_bytes() for path in _manifest_paths(source)}
+
+
+def _restore_manifests(
+    source: DependencySource, snapshot: dict[Path, bytes]
+) -> None:
+    """
+    Restore manifest bytes captured by `_snapshot_manifests`.
+
+    A failure restoring one file does not prevent the remaining files from
+    being restored.
+    """
+    for path, contents in snapshot.items():
+        try:
+            path.write_bytes(contents)
+        except OSError as e:  # noqa: PERF203
+            logger.warning(f"could not restore {path} during rollback: {e}")
+
+
+def _reaudit_versions(
+    service: VulnerabilityService, advice: list[FixAdvice]
+) -> dict[str, frozenset[str]]:
+    """
+    Re-query the service for every resolved fix version.
+
+    Returns a mapping of package name to the vulnerability identifiers still
+    reported after the fix. An empty mapping means the post-fix audit has
+    zero hits, which is the acceptance condition for writing.
+    """
+    remaining: dict[str, frozenset[str]] = {}
+    for a in advice:
+        if a.chosen_version is None:
+            continue
+        _, vulns = service.query(ResolvedDependency(a.dep.name, a.chosen_version))
+        if vulns:
+            remaining[a.dep.canonical_name] = frozenset(v.id for v in vulns)
+    return remaining
+
+
+def _downgrade_advice(advice: FixAdvice, reason: str) -> FixAdvice:
+    """
+    Mark a piece of advice undeterminable after a failed post-fix verification.
+    """
+    from dataclasses import replace
+
+    return replace(
+        advice,
+        classification=AdviceClassification.Undeterminable,
+        chosen_version=None,
+        reason=reason,
+    )
+
+
 def _parser() -> argparse.ArgumentParser:  # pragma: no cover
     parser = argparse.ArgumentParser(
         prog="pip-audit",
@@ -332,6 +424,15 @@ def _parser() -> argparse.ArgumentParser:  # pragma: no cover
         help="automatically upgrade dependencies with known vulnerabilities",
     )
     parser.add_argument(
+        "--explain",
+        action="store_true",
+        help=(
+            "with `--fix`: emit explainable fix advice, including affected ranges, the chosen "
+            "fix point, rejected candidates with reasons, and manifest-constraint conflicts; "
+            "fixes are refused unless the resolved versions re-audit with zero hits"
+        ),
+    )
+    parser.add_argument(
         "--require-hashes",
         action="store_true",
         help="require a hash to check each requirement against, for repeatable audits; this option "
@@ -457,7 +558,12 @@ def audit() -> None:  # pragma: no cover
 
     output_desc = args.desc.to_bool(args.format)
     output_aliases = args.aliases.to_bool(args.format)
+    # The advice list is populated later, once fix resolution runs; the
+    # formatter reads it through an accessor so later reassignment is visible.
+    advice: list[FixAdvice] = []
     formatter = args.format.to_format(output_desc, output_aliases)
+    if args.explain and args.format is OutputFormatChoice.Json:
+        formatter = JsonFormat(output_desc, output_aliases, advice=lambda: advice)
 
     # Check for flags that are only valid with project paths
     if args.project_path is None:
@@ -583,35 +689,117 @@ def audit() -> None:  # pragma: no cover
             )
 
         # If the `--fix` flag has been applied, find a set of suitable fix versions and upgrade the
-        # dependencies at the source
-        fixes = []
+        # dependencies at the source. `advice` is shared by reference with the JSON formatter.
+        fixes: list[FixVersion] = []
         fixed_pkg_count = 0
         fixed_vuln_count = 0
         if args.fix:
-            for fix in resolve_fix_versions(service, result, state):
-                if args.dry_run:
-                    if fix.is_skipped():
-                        fix = cast(SkippedFixVersion, fix)
-                        logger.info(
-                            f"Dry run: would have skipped {fix.dep.name} "
-                            f"upgrade because {fix.skip_reason}"
-                        )
-                    else:
-                        fix = cast(ResolvedFixVersion, fix)
-                        logger.info(f"Dry run: would have upgraded {fix.dep.name} to {fix.version}")
-                    continue
+            if args.explain:
+                # The constraint snapshot is parsed before any write: an unparsable
+                # manifest or a conflicting duplicate declaration rejects the whole
+                # run, so we never produce a partial fix.
+                try:
+                    constraints = source.constraint_snapshot()
+                except ConstraintSnapshotError as cse:
+                    _fatal(str(cse))
 
-                if not fix.is_skipped():
-                    fix = cast(ResolvedFixVersion, fix)
+                paired = list(
+                    resolve_fix_versions_explained(
+                        service, result, constraints=constraints, state=state
+                    )
+                )
+                advice.extend(a for _fix, a in paired)
+                fixes = [fix for fix, _a in paired]
+
+                # Pre-write gate: the engine only returns Upgrade advice for versions
+                # that already re-audited clean. Anything else is refused and the
+                # manifest is left byte-for-byte untouched.
+                applicable = [
+                    a
+                    for a in advice
+                    if a.classification is AdviceClassification.Upgrade
+                ]
+                refused = [a for a in advice if a.is_skipped()]
+                for a in refused:
+                    logger.warning(
+                        f"Refusing to fix {a.dep.name}: {a.classification.value}: {a.reason}"
+                    )
+
+                if args.dry_run:
+                    for a in advice:
+                        if a.is_skipped():
+                            logger.info(
+                                f"Dry run: would have skipped {a.dep.name} upgrade because "
+                                f"{a.reason}"
+                            )
+                        else:
+                            logger.info(
+                                f"Dry run: would have upgraded {a.dep.name} to "
+                                f"{a.chosen_version}"
+                            )
+                else:
+                    # Transactional application: apply every applicable fix, then
+                    # re-audit the upgraded versions. A single post-write hit rolls
+                    # the whole batch back.
+                    manifest_snapshot = _snapshot_manifests(source)
                     try:
-                        source.fix(fix)
-                        fixed_pkg_count += 1
-                        fixed_vuln_count += len(result[fix.dep])
-                    except DependencySourceError as dse:
-                        skip_reason = str(dse)
-                        logger.debug(skip_reason)
-                        fix = SkippedFixVersion(fix.dep, skip_reason)
-                fixes.append(fix)
+                        for a in applicable:
+                            assert a.chosen_version is not None
+                            fix_version = ResolvedFixVersion(a.dep, a.chosen_version)
+                            source.fix(fix_version)
+                            fixed_pkg_count += 1
+                            fixed_vuln_count += len(result[a.dep])
+
+                        remaining = _reaudit_versions(service, applicable)
+                        if remaining:
+                            details = "; ".join(
+                                f"{name} still reports {', '.join(sorted(ids))}"
+                                for name, ids in remaining.items()
+                            )
+                            raise FixVerificationError(
+                                f"post-fix re-audit was not clean: {details}"
+                            )
+                    except (DependencySourceError, FixVerificationError) as exc:
+                        logger.error(
+                            f"fix verification failed, rolling back all manifest changes: {exc}"
+                        )
+                        _restore_manifests(source, manifest_snapshot)
+                        fixed_pkg_count = 0
+                        fixed_vuln_count = 0
+                        fixes = [
+                            SkippedFixVersion(
+                                a.dep,
+                                f"fix rolled back after failed verification: {exc}",
+                            )
+                            for a in advice
+                        ]
+                        # Mutate in place: the JSON formatter holds the same list.
+                        advice[:] = [_downgrade_advice(a, str(exc)) for a in advice]
+            else:
+                for fix in resolve_fix_versions(service, result, state):
+                    if args.dry_run:
+                        if fix.is_skipped():
+                            fix = cast(SkippedFixVersion, fix)
+                            logger.info(
+                                f"Dry run: would have skipped {fix.dep.name} "
+                                f"upgrade because {fix.skip_reason}"
+                            )
+                        else:
+                            fix = cast(ResolvedFixVersion, fix)
+                            logger.info(f"Dry run: would have upgraded {fix.dep.name} to {fix.version}")
+                        continue
+
+                    if not fix.is_skipped():
+                        fix = cast(ResolvedFixVersion, fix)
+                        try:
+                            source.fix(fix)
+                            fixed_pkg_count += 1
+                            fixed_vuln_count += len(result[fix.dep])
+                        except DependencySourceError as dse:
+                            skip_reason = str(dse)
+                            logger.debug(skip_reason)
+                            fix = SkippedFixVersion(fix.dep, skip_reason)
+                    fixes.append(fix)
 
     if vuln_count > 0:
         if vuln_ignore_count:
@@ -632,6 +820,14 @@ def audit() -> None:  # pragma: no cover
                 f"{'package' if fixed_pkg_count == 1 else 'packages'}"
             )
         print(summary_msg, file=sys.stderr)
+        if args.fix and args.explain and advice:
+            # Auditable classification tally; the same counts are derivable
+            # from the `fix_advice` block in the JSON output.
+            tally: dict[str, int] = {}
+            for a in advice:
+                tally[a.classification.value] = tally.get(a.classification.value, 0) + 1
+            stats = ", ".join(f"{name}={tally[name]}" for name in sorted(tally))
+            print(f"Fix advice classification: {stats}", file=sys.stderr)
         with _output_io(args.output) as io:
             print(formatter.format(result, fixes), file=io)
         if pkg_count != fixed_pkg_count:

@@ -22,6 +22,7 @@ from pip_requirements_parser import (
     RequirementsFile,
 )
 
+from pip_audit._constraints import PackageConstraint, snapshot_from_requirement_files
 from pip_audit._dependency_source import (
     DependencyFixError,
     DependencySource,
@@ -184,6 +185,16 @@ class RequirementSource(DependencySource):
         # Now query the installed packages.
         for name, version in ve.installed_packages:
             yield ResolvedDependency(name=name, version=version)
+
+    def constraint_snapshot(self) -> dict[str, list[PackageConstraint]]:
+        """
+        Parse the requirements files offline and return their constraints.
+
+        Used by the explainable fix engine to reject fix versions that the
+        manifest could never install. Parse failures and conflicting
+        duplicate declarations are fatal (`ConstraintSnapshotError`).
+        """
+        return snapshot_from_requirement_files(self._filenames)
 
     def fix(self, fix_version: ResolvedFixVersion) -> None:
         """

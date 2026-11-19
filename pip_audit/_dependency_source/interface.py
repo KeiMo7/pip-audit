@@ -8,6 +8,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 
+from pip_audit._constraints import PackageConstraint
 from pip_audit._fix import ResolvedFixVersion
 from pip_audit._service import Dependency
 
@@ -35,6 +36,19 @@ class DependencySource(ABC):
         Upgrade a dependency to the given fix version.
         """
         raise NotImplementedError
+
+    def constraint_snapshot(self) -> dict[str, list[PackageConstraint]]:
+        """
+        Return the manifest-declared version constraints for this source.
+
+        Sources without a version manifest (e.g. a live `pip` environment)
+        return an empty snapshot, which means "no additional constraints".
+        Sources backed by a manifest override this to parse it offline; a
+        parse failure or a conflicting duplicate declaration raises
+        `ConstraintSnapshotError`, which callers treat as fatal so that no
+        partial fix is ever written.
+        """
+        return {}
 
 
 class DependencySourceError(Exception):

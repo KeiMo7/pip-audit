@@ -11,6 +11,8 @@ from typing import Any, cast
 
 from packaging.version import Version
 
+from pip_audit._constraints import PackageConstraint
+from pip_audit._fix_advice import FixAdvice, resolve_all_advice
 from pip_audit._service import (
     Dependency,
     ResolvedDependency,
@@ -124,3 +126,65 @@ class FixResolutionImpossible(Exception):
     """
 
     pass
+
+
+def resolve_fix_advice(
+    service: VulnerabilityService,
+    result: dict[Dependency, list[VulnerabilityResult]],
+    *,
+    constraints: dict[str, list[PackageConstraint]] | None = None,
+    state: AuditState = AuditState(),
+    max_reaudit_iterations: int = 10,
+) -> Iterator[FixAdvice]:
+    """
+    Resolve explainable, constraint-aware fix advice for every vulnerable
+    dependency.
+
+    Unlike `resolve_fix_versions`, each emitted `FixAdvice` carries its
+    classification, the affected ranges, the chosen fix point, the rejected
+    candidates with reasons, and any manifest constraints blocking the fix.
+    Nothing in this path performs a write.
+    """
+    yield from resolve_all_advice(
+        service,
+        result,
+        constraints=constraints,
+        state=state,
+        max_reaudit_iterations=max_reaudit_iterations,
+    )
+
+
+def advice_to_fix_version(advice: FixAdvice) -> FixVersion:
+    """
+    Project a `FixAdvice` onto the legacy two-class `FixVersion` hierarchy.
+
+    This keeps consumers that predate the explainable engine working:
+    `Fixed`/`Upgrade` advice becomes a `ResolvedFixVersion`, while conflict and
+    undeterminable advice becomes a `SkippedFixVersion` whose skip reason is
+    the advice's explanation.
+    """
+    if advice.is_skipped() or advice.chosen_version is None:
+        return SkippedFixVersion(advice.dep, advice.reason)
+    return ResolvedFixVersion(advice.dep, advice.chosen_version)
+
+
+def resolve_fix_versions_explained(
+    service: VulnerabilityService,
+    result: dict[Dependency, list[VulnerabilityResult]],
+    *,
+    constraints: dict[str, list[PackageConstraint]] | None = None,
+    state: AuditState = AuditState(),
+    max_reaudit_iterations: int = 10,
+) -> Iterator[tuple[FixVersion, FixAdvice]]:
+    """
+    Like `resolve_fix_versions`, but each legacy `FixVersion` is paired with
+    the full `FixAdvice` that explains it.
+    """
+    for advice in resolve_fix_advice(
+        service,
+        result,
+        constraints=constraints,
+        state=state,
+        max_reaudit_iterations=max_reaudit_iterations,
+    ):
+        yield advice_to_fix_version(advice), advice

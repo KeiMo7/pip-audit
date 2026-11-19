@@ -8,6 +8,19 @@ All versions prior to 0.0.9 are untracked.
 
 ## [Unreleased]
 
+### Added
+
+* Explainable, constraint-aware fix advice behind `pip-audit --fix --explain`.
+  Each recommendation now carries its affected version range (derived offline
+  from neighboring fix points), the vulnerability identifiers that motivated
+  it, the chosen fix point, and every rejected candidate with the reason for
+  rejection. Advice is classified as `fixed`, `upgrade`, `constraint-conflict`
+  or `undeterminable`. Fixes whose post-write re-audit is not clean are
+  refused and any manifest changes are rolled back; constraint conflicts leave
+  the manifest byte-for-byte untouched. The legacy `--fix` behavior and output
+  schema are unchanged; the new data is appended under a separate
+  `fix_advice` JSON key.
+
 ### Fixed
 
 * Editable requirements skipped with `--skip-editable` no longer require a hash

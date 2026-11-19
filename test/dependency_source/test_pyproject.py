@@ -58,6 +58,44 @@ dependencies = [
         list(source.collect())
 
 
+def test_pyproject_constraint_snapshot(req_file):
+    source = _init_pyproject(
+        req_file(),
+        """
+[project]
+dependencies = [
+  "flask<2.1.0",
+  "requests>=2.0",
+]
+    """,
+    )
+    snapshot = source.constraint_snapshot()
+    assert set(snapshot) == {"flask", "requests"}
+    flask = snapshot["flask"][0]
+    assert str(flask.specifier) == "<2.1.0"
+    assert flask.blocks(Version("2.2.0"))
+    assert not flask.blocks(Version("2.0.0"))
+    # An exact pin is never a blocking upper bound.
+    pinned = _init_pyproject(
+        req_file(),
+        """
+[project]
+dependencies = ["flask==2.0.1"]
+    """,
+    )
+    assert not pinned.constraint_snapshot()["flask"][0].blocks(Version("3.0.0"))
+
+
+def test_pyproject_constraint_snapshot_invalid_toml(req_file):
+    from pip_audit._constraints import ConstraintSnapshotError
+
+    path = req_file()
+    path.write_text("this is = = not valid toml")
+    source = pyproject.PyProjectSource(path)
+    with pytest.raises(ConstraintSnapshotError):
+        source.constraint_snapshot()
+
+
 def test_pyproject_source_no_deps(monkeypatch, req_file):
     logger = pretend.stub(warning=pretend.call_recorder(lambda s: None))
     monkeypatch.setattr(pyproject, "logger", logger)

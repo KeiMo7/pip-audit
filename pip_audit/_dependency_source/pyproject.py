@@ -15,6 +15,11 @@ import tomli_w
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 
+from pip_audit._constraints import (
+    ConstraintSnapshotError,
+    PackageConstraint,
+    snapshot_from_requirement_strings,
+)
 from pip_audit._dependency_source import (
     DependencyFixError,
     DependencySource,
@@ -104,6 +109,32 @@ class PyProjectSource(DependencySource):
                 # Now query the installed packages.
                 for name, version in ve.installed_packages:
                     yield ResolvedDependency(name=name, version=version)
+
+    def constraint_snapshot(self) -> dict[str, list[PackageConstraint]]:
+        """
+        Parse `project.dependencies` offline and return their constraints.
+        """
+        try:
+            with self.filename.open("rb") as f:
+                pyproject_data = tomli.load(f)
+        except OSError as e:
+            raise ConstraintSnapshotError(
+                f"could not read pyproject file {self.filename}: {e}"
+            ) from e
+        except tomli.TOMLDecodeError as e:
+            raise ConstraintSnapshotError(
+                f"pyproject file {self.filename} is not valid TOML: {e}"
+            ) from e
+
+        project = pyproject_data.get("project")
+        if project is None:
+            raise ConstraintSnapshotError(
+                f"pyproject file {self.filename} does not contain `project` section"
+            )
+        deps = project.get("dependencies") or []
+        return snapshot_from_requirement_strings(
+            [str(dep) for dep in deps], source=str(self.filename)
+        )
 
     def fix(self, fix_version: ResolvedFixVersion) -> None:
         """
