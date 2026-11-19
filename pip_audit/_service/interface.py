@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, NewType
 
@@ -15,6 +15,33 @@ from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 VulnerabilityID = NewType("VulnerabilityID", str)
+
+# Canonical severity ranking, shared by every vulnerability service (online
+# and offline alike) so that severity-based ordering is consistent regardless
+# of where the vulnerability data came from.
+#
+# NOTE: This ranking is only ever used to *compare* two severities (e.g. to
+# keep the most severe one when merging results). Severity labels themselves
+# are always passed through verbatim, never rewritten.
+_SEVERITY_RANKS = {
+    "critical": 4,
+    "high": 3,
+    "medium": 2,
+    "moderate": 2,
+    "low": 1,
+}
+
+
+def severity_rank(severity: str | None) -> int:
+    """
+    Return the canonical rank for a severity label.
+
+    Unknown or missing severities rank lowest; the label itself is always
+    preserved as-is wherever it is emitted.
+    """
+    if severity is None:
+        return 0
+    return _SEVERITY_RANKS.get(severity.lower(), 0)
 
 
 def _id_comparison_key(id: str) -> int:
@@ -69,6 +96,16 @@ class ResolvedDependency(Dependency):
 
     version: Version
 
+    sources: frozenset[str] = field(default=frozenset(), compare=False)
+    """
+    The set of dependency manifests (e.g. requirements files) this dependency
+    was collected from.
+
+    This is informational only: it does not participate in equality or
+    hashing, so the same dependency collected from multiple manifests is
+    still deduplicated while retaining its origin markers.
+    """
+
 
 @dataclass(frozen=True)
 class SkippedDependency(Dependency):
@@ -111,6 +148,13 @@ class VulnerabilityResult:
     When the vulnerability was first published.
     """
 
+    severity: str | None = None
+    """
+    The severity label for this vulnerability, exactly as provided by the
+    vulnerability source (e.g. a local database). Passed through verbatim;
+    `None` when the source does not provide one.
+    """
+
     @classmethod
     def create(
         cls,
@@ -118,6 +162,7 @@ class VulnerabilityResult:
         description: str,
         fix_versions: list[Version],
         published: datetime | None,
+        severity: str | None = None,
     ) -> VulnerabilityResult:
         """
         Instantiates a `VulnerabilityResult` with the given data, prioritizing
@@ -125,7 +170,7 @@ class VulnerabilityResult:
         """
 
         ids.sort(key=_id_comparison_key)
-        return cls(ids[0], description, fix_versions, set(ids[1:]), published)
+        return cls(ids[0], description, fix_versions, set(ids[1:]), published, severity)
 
     def alias_of(self, other: VulnerabilityResult) -> bool:
         """
@@ -139,11 +184,19 @@ class VulnerabilityResult:
     def merge_aliases(self, other: VulnerabilityResult) -> VulnerabilityResult:
         """
         Merge `other`'s aliases into this result, returning a new result.
+
+        When both results carry a severity label, the most severe one is
+        kept (using the shared `severity_rank` ordering); labels themselves
+        are never rewritten. Merging is idempotent: merging the same pair
+        of results any number of times yields the same result.
         """
 
         # Our own ID should never occur in the alias set.
         aliases = self.aliases | other.aliases - {self.id}
-        return replace(self, aliases=aliases)
+        severity = self.severity
+        if severity_rank(other.severity) > severity_rank(self.severity):
+            severity = other.severity
+        return replace(self, aliases=aliases, severity=severity)
 
     def has_any_id(self, ids: set[str]) -> bool:
         """

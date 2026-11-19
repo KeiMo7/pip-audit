@@ -5,7 +5,7 @@ Core auditing APIs.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 
 from pip_audit._dependency_source import DependencySource
@@ -103,3 +103,60 @@ class Auditor:
                     _add_unique_vulnerability(unique_vulns, seen_aliases, v)
 
                 yield dep, unique_vulns
+
+
+@dataclass(frozen=True)
+class AuditDiff:
+    """
+    The entry-level difference between two audit results, e.g. the results
+    of auditing the same dependencies before and after a local vulnerability
+    database update.
+    """
+
+    added: list[tuple[Dependency, VulnerabilityResult]]
+    """
+    `(dependency, vulnerability)` pairs present in the newer result only.
+    """
+
+    removed: list[tuple[Dependency, VulnerabilityResult]]
+    """
+    `(dependency, vulnerability)` pairs present in the older result only.
+    """
+
+
+def _result_entries(
+    result: Mapping[Dependency, list[VulnerabilityResult]],
+) -> dict[tuple[str, str, str], tuple[Dependency, VulnerabilityResult]]:
+    """
+    Flatten an audit result into a mapping of `(name, version, vuln id)`
+    keys, for entry-level comparison.
+    """
+    entries: dict[tuple[str, str, str], tuple[Dependency, VulnerabilityResult]] = {}
+    for dep, vulns in result.items():
+        if dep.is_skipped():
+            continue
+        for vuln in vulns:
+            # A vulnerability entry is identified by the dependency it
+            # affects plus its (alias-merged) primary ID.
+            key = (dep.canonical_name, str(getattr(dep, "version", "")), vuln.id)
+            entries[key] = (dep, vuln)
+    return entries
+
+
+def diff_results(
+    before: Mapping[Dependency, list[VulnerabilityResult]],
+    after: Mapping[Dependency, list[VulnerabilityResult]],
+) -> AuditDiff:
+    """
+    Compute the entry-level difference between two audit results.
+
+    Returns an `AuditDiff` whose `added` and `removed` lists identify each
+    `(dependency, vulnerability)` pair that appears only in `after` or only
+    in `before`, respectively. Both lists are sorted deterministically.
+    """
+    before_entries = _result_entries(before)
+    after_entries = _result_entries(after)
+
+    added = [after_entries[key] for key in sorted(after_entries.keys() - before_entries.keys())]
+    removed = [before_entries[key] for key in sorted(before_entries.keys() - after_entries.keys())]
+    return AuditDiff(added=added, removed=removed)

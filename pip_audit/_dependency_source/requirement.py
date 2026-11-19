@@ -15,7 +15,7 @@ from typing import IO
 
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 from pip_requirements_parser import (
     InstallRequirement,
     InvalidRequirementLine,
@@ -52,6 +52,7 @@ class RequirementSource(DependencySource):
         no_deps: bool = False,
         disable_pip: bool = False,
         skip_editable: bool = False,
+        skip_invalid: bool = False,
         index_url: str | None = None,
         extra_index_urls: list[str] = [],
         state: AuditState = AuditState(),
@@ -75,6 +76,13 @@ class RequirementSource(DependencySource):
         `skip_editable` controls whether requirements marked as "editable" are skipped.
         By default, editable requirements are not skipped.
 
+        `skip_invalid` controls how unparseable or unresolvable requirement
+        specifiers are handled: if `True`, each such requirement is yielded as
+        a `SkippedDependency` (identifying the dependency and constraint)
+        instead of failing the entire collection. Additionally, dependencies
+        that appear in multiple input files are deduplicated while recording
+        every file they came from in `ResolvedDependency.sources`.
+
         `index_url` is the base URL of the package index.
 
         `extra_index_urls` are the extra URLs of package indexes.
@@ -86,6 +94,7 @@ class RequirementSource(DependencySource):
         self._no_deps = no_deps
         self._disable_pip = disable_pip
         self._skip_editable = skip_editable
+        self._skip_invalid = skip_invalid
         self._index_url = index_url
         self._extra_index_urls = extra_index_urls
         self.state = state
@@ -141,19 +150,37 @@ class RequirementSource(DependencySource):
     def _collect_from_files(self, filenames: list[Path]) -> Iterator[Dependency]:
         # Figure out whether we have a fully resolved set of dependencies.
         reqs: list[InstallRequirement] = []
+        req_files: list[Path] = []
+        invalid_lines: list[tuple[Path, InvalidRequirementLine]] = []
         require_hashes: bool = self._require_hashes
         for filename in filenames:
             rf = RequirementsFile.from_file(filename)
             if len(rf.invalid_lines) > 0:
-                invalid = rf.invalid_lines[0]
-                raise InvalidRequirementSpecifier(
-                    f"requirement file {filename} contains invalid specifier at "
-                    f"line {invalid.line_number}: {invalid.error_message}"
-                )
+                if not self._skip_invalid:
+                    invalid = rf.invalid_lines[0]
+                    raise InvalidRequirementSpecifier(
+                        f"requirement file {filename} contains invalid specifier at "
+                        f"line {invalid.line_number}: {invalid.error_message}"
+                    )
+                # In tolerant mode, invalid lines are reported individually
+                # (below) instead of failing the whole collection.
+                invalid_lines.extend((filename, invalid) for invalid in rf.invalid_lines)
 
             # If one or more requirements have a hash, this implies `--require-hashes`.
             require_hashes = require_hashes or any(req.hash_options for req in rf.requirements)
             reqs.extend(rf.requirements)
+            req_files.extend([filename] * len(rf.requirements))
+
+        # Report each unparseable line individually, identifying the file,
+        # line number, and the offending constraint.
+        for filename, invalid in invalid_lines:
+            yield SkippedDependency(
+                name=invalid.line.strip(),
+                skip_reason=(
+                    f"invalid requirement in {filename} at line "
+                    f"{invalid.line_number}: {invalid.error_message}"
+                ),
+            )
 
         # If the user has supplied `--no-deps` or there are hashed requirements, we should assume
         # that we have a fully resolved set of dependencies and we should waste time by invoking
@@ -164,7 +191,7 @@ class RequirementSource(DependencySource):
                     "the --disable-pip flag can only be used with a hashed requirements files or "
                     "if the --no-deps flag has been provided"
                 )
-            yield from self._collect_preresolved_deps(iter(reqs), require_hashes)
+            yield from self._collect_preresolved_deps(iter(reqs), require_hashes, req_files)
             return
 
         ve_args = []
@@ -293,12 +320,34 @@ class RequirementSource(DependencySource):
                 continue
 
     def _collect_preresolved_deps(
-        self, reqs: Iterator[InstallRequirement], require_hashes: bool
+        self,
+        reqs: Iterator[InstallRequirement],
+        require_hashes: bool,
+        req_files: list[Path] | None = None,
     ) -> Iterator[Dependency]:
         """
         Collect pre-resolved (pinned) dependencies.
         """
+        reqs = list(reqs)
+        if req_files is None:
+            req_files = [Path("<unknown>")] * len(reqs)
+
+        # First pass (no yields): group requirements by name so that we can
+        # detect conflicting duplicates up front and record every manifest
+        # each dependency was collected from.
+        origins: dict[str, set[str]] = {}
+        specifiers_by_name: dict[str, set[SpecifierSet]] = {}
+        for req, req_file in zip(reqs, req_files, strict=True):
+            if req.req is None or (req.marker is not None and not req.marker.evaluate()):
+                continue
+            origins.setdefault(req.name, set()).add(str(req_file))
+            specifiers_by_name.setdefault(req.name, set()).add(req.specifier)
+        conflicting_names = {
+            name for name, specifiers in specifiers_by_name.items() if len(specifiers) > 1
+        }
+
         req_specifiers: dict[str, SpecifierSet] = {}
+        conflicts_reported: set[str] = set()
         for req in reqs:
             if self._skip_editable and req.is_editable:
                 yield SkippedDependency(
@@ -324,6 +373,20 @@ class RequirementSource(DependencySource):
                 # TODO(ww): Remove this `no cover` pragma once we're 3.10+.
                 # See: https://github.com/nedbat/coveragepy/issues/198
                 continue  # pragma: no cover
+
+            if self._skip_invalid and req.name in conflicting_names:
+                # The same package is required with conflicting specifiers;
+                # in tolerant mode we report it once instead of failing.
+                if req.name not in conflicts_reported:
+                    conflicts_reported.add(req.name)
+                    yield SkippedDependency(
+                        name=req.name,
+                        skip_reason=(
+                            f"package {req.name} has conflicting requirements: "
+                            f"{sorted(str(s) for s in specifiers_by_name[req.name])}"
+                        ),
+                    )
+                continue
 
             duplicate_req_specifier = req_specifiers.get(req.name)
 
@@ -352,15 +415,48 @@ class RequirementSource(DependencySource):
                     skip_reason="URL requirements cannot be pinned to a specific package version",
                 )
             elif not req.specifier:
-                raise RequirementSourceError(f"requirement {req.name} is not pinned: {str(req)}")
+                if self._skip_invalid:
+                    yield SkippedDependency(
+                        name=req.name,
+                        skip_reason=f"requirement is not pinned: {str(req)}",
+                    )
+                else:
+                    raise RequirementSourceError(
+                        f"requirement {req.name} is not pinned: {str(req)}"
+                    )
             else:
                 pinned_specifier = PINNED_SPECIFIER_RE.match(str(req.specifier))
                 if pinned_specifier is None:
+                    if self._skip_invalid:
+                        yield SkippedDependency(
+                            name=req.name,
+                            skip_reason=(
+                                f"requirement is not pinned to an exact version: {str(req)}"
+                            ),
+                        )
+                        continue
                     raise RequirementSourceError(
                         f"requirement {req.name} is not pinned to an exact version: {str(req)}"
                     )
 
-                yield ResolvedDependency(req.name, Version(pinned_specifier.group("version")))
+                try:
+                    version = Version(pinned_specifier.group("version"))
+                except InvalidVersion:
+                    if self._skip_invalid:
+                        yield SkippedDependency(
+                            name=req.name,
+                            skip_reason=(
+                                f"requirement has an unparseable version constraint: {str(req)}"
+                            ),
+                        )
+                        continue
+                    raise
+
+                # In tolerant mode, record every manifest this dependency
+                # was collected from; the markers don't participate in
+                # dependency equality, so duplicates still collapse.
+                sources = frozenset(origins[req.name]) if self._skip_invalid else frozenset()
+                yield ResolvedDependency(req.name, version, sources=sources)
 
 
 class RequirementSourceError(DependencySourceError):

@@ -25,6 +25,82 @@ from pip_audit._service.interface import (
 logger = logging.getLogger(__name__)
 
 
+def _result_from_osv_vuln(vuln: dict[str, Any], canonical_name: str) -> VulnerabilityResult | None:
+    """
+    Convert a single OSV-schema vulnerability entry into a `VulnerabilityResult`
+    for the given canonical package name.
+
+    Returns `None` for entries that should not produce a result (unsupported
+    schema version, withdrawn, or missing an `affected` list).
+
+    This is the single shared interpretation of OSV vulnerability records: it
+    is used both by the online `OsvService` and by offline local-database
+    matching, so that both paths judge the same record identically.
+    """
+    # Sanity check: only the v1 schema is specified at the moment,
+    # and the code below probably won't work with future incompatible
+    # schemas without additional changes.
+    # The absence of a schema is treated as 1.0.0, per the OSV spec.
+    schema_version = Version(vuln.get("schema_version", "1.0.0"))
+    if schema_version.major != 1:
+        logger.warning(f"Unsupported OSV schema version: {schema_version}")
+        return None
+
+    id = vuln["id"]
+
+    # If the vulnerability has been withdrawn, we skip it entirely.
+    withdrawn_at = vuln.get("withdrawn")
+    if withdrawn_at is not None:
+        logger.debug(f"OSV vuln entry '{id}' marked as withdrawn at {withdrawn_at}")
+        return None
+
+    # The summary is intended to be shorter, so we prefer it over
+    # details, if present. However, neither is required.
+    description = vuln.get("summary")
+    if description is None:
+        description = vuln.get("details")
+    if description is None:
+        description = "N/A"
+
+    # The "summary" field should be a single line, but "details" might
+    # be multiple (Markdown-formatted) lines. So, we normalize our
+    # description into a single line (and potentially break the Markdown
+    # formatting in the process).
+    description = description.replace("\n", " ")
+
+    # OSV doesn't mandate this field either. There's very little we
+    # can do without it, so we skip any results that are missing it.
+    affecteds = vuln.get("affected")
+    if affecteds is None:
+        logger.warning(f"OSV vuln entry '{id}' is missing 'affected' list")
+        return None
+
+    fix_versions: list[Version] = []
+    for affected in affecteds:
+        pkg = affected["package"]
+        # We only care about PyPI versions
+        if pkg["name"] == canonical_name and pkg["ecosystem"] == "PyPI":
+            for ranges in affected.get("ranges", []):
+                if ranges["type"] == "ECOSYSTEM":
+                    # Filter out non-fix versions
+                    fix_version_strs = [
+                        version["fixed"] for version in ranges["events"] if "fixed" in version
+                    ]
+                    # Convert them to version objects
+                    fix_versions = [Version(version_str) for version_str in fix_version_strs]
+                    break
+
+    # The ranges aren't guaranteed to come in chronological order
+    fix_versions.sort()
+
+    return VulnerabilityResult.create(
+        ids=[id, *vuln.get("aliases", [])],
+        description=description,
+        fix_versions=fix_versions,
+        published=VulnerabilityService._parse_rfc3339(vuln.get("published")),
+    )
+
+
 class OsvService(VulnerabilityService):
     """
     An implementation of `VulnerabilityService` that uses OSV to provide Python
@@ -89,73 +165,8 @@ class OsvService(VulnerabilityService):
 
         vuln: dict[str, Any]
         for vuln in response_json["vulns"]:
-            # Sanity check: only the v1 schema is specified at the moment,
-            # and the code below probably won't work with future incompatible
-            # schemas without additional changes.
-            # The absence of a schema is treated as 1.0.0, per the OSV spec.
-            schema_version = Version(vuln.get("schema_version", "1.0.0"))
-            if schema_version.major != 1:
-                logger.warning(f"Unsupported OSV schema version: {schema_version}")
-                continue
-
-            id = vuln["id"]
-
-            # If the vulnerability has been withdrawn, we skip it entirely.
-            withdrawn_at = vuln.get("withdrawn")
-            if withdrawn_at is not None:
-                logger.debug(f"OSV vuln entry '{id}' marked as withdrawn at {withdrawn_at}")
-                continue
-
-            # The summary is intended to be shorter, so we prefer it over
-            # details, if present. However, neither is required.
-            description = vuln.get("summary")
-            if description is None:
-                description = vuln.get("details")
-            if description is None:
-                description = "N/A"
-
-            # The "summary" field should be a single line, but "details" might
-            # be multiple (Markdown-formatted) lines. So, we normalize our
-            # description into a single line (and potentially break the Markdown
-            # formatting in the process).
-            description = description.replace("\n", " ")
-
-            # OSV doesn't mandate this field either. There's very little we
-            # can do without it, so we skip any results that are missing it.
-            affecteds = vuln.get("affected")
-            if affecteds is None:
-                logger.warning(f"OSV vuln entry '{id}' is missing 'affected' list")
-                continue
-
-            fix_versions: list[Version] = []
-            for affected in affecteds:
-                pkg = affected["package"]
-                # We only care about PyPI versions
-                if pkg["name"] == spec.canonical_name and pkg["ecosystem"] == "PyPI":
-                    for ranges in affected.get("ranges", []):
-                        if ranges["type"] == "ECOSYSTEM":
-                            # Filter out non-fix versions
-                            fix_version_strs = [
-                                version["fixed"]
-                                for version in ranges["events"]
-                                if "fixed" in version
-                            ]
-                            # Convert them to version objects
-                            fix_versions = [
-                                Version(version_str) for version_str in fix_version_strs
-                            ]
-                            break
-
-            # The ranges aren't guaranteed to come in chronological order
-            fix_versions.sort()
-
-            results.append(
-                VulnerabilityResult.create(
-                    ids=[id, *vuln.get("aliases", [])],
-                    description=description,
-                    fix_versions=fix_versions,
-                    published=self._parse_rfc3339(vuln.get("published")),
-                )
-            )
+            result = _result_from_osv_vuln(vuln, spec.canonical_name)
+            if result is not None:
+                results.append(result)
 
         return spec, results

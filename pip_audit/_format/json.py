@@ -67,11 +67,16 @@ class JsonFormat(VulnerabilityFormat):
             }
 
         dep = cast(service.ResolvedDependency, dep)
-        return {
+        dep_json: dict[str, Any] = {
             "name": dep.canonical_name,
             "version": str(dep.version),
             "vulns": [self._format_vuln(vuln) for vuln in vulns],
         }
+        # Origin markers are only emitted when present (e.g. offline
+        # collection from multiple manifests); online output is unchanged.
+        if dep.sources:
+            dep_json["sources"] = sorted(dep.sources)
+        return dep_json
 
     def _format_vuln(self, vuln: service.VulnerabilityResult) -> dict[str, Any]:
         vuln_json = {
@@ -82,6 +87,10 @@ class JsonFormat(VulnerabilityFormat):
             vuln_json["aliases"] = list(vuln.aliases)
         if self.output_desc:
             vuln_json["description"] = vuln.description
+        # The severity label is passed through verbatim, and only emitted
+        # when the vulnerability source provided one.
+        if vuln.severity is not None:
+            vuln_json["severity"] = vuln.severity
         return vuln_json
 
     def _format_fix(self, fix_version: fix.FixVersion) -> dict[str, Any]:

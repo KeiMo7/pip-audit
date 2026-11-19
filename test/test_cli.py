@@ -1,3 +1,7 @@
+import errno
+import json
+import os
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pretend  # type: ignore
@@ -11,6 +15,202 @@ from pip_audit._cli import (
     VulnerabilityDescriptionChoice,
     VulnerabilityServiceChoice,
 )
+
+
+def _local_db(path, entries, **kwargs):
+    doc = {
+        "format_version": 1,
+        "generated_at": (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "vuln_count": len(entries),
+        "vulns": entries,
+    }
+    doc.update(kwargs)
+    path.write_text(json.dumps(doc))
+    return path
+
+
+def _db_entry(id, name, introduced, fixed, severity=None):
+    entry = {
+        "id": id,
+        "summary": f"summary of {id}",
+        "affected": [
+            {
+                "package": {"name": name, "ecosystem": "PyPI"},
+                "ranges": [
+                    {"type": "ECOSYSTEM", "events": [{"introduced": introduced}, {"fixed": fixed}]}
+                ],
+            }
+        ],
+    }
+    if severity is not None:
+        entry["severity"] = severity
+    return entry
+
+
+def _run_audit(monkeypatch, args):
+    parser = pip_audit._cli._parser()
+    monkeypatch.setattr(pip_audit._cli, "_parse_args", lambda *a: parser.parse_args(args))
+    try:
+        pip_audit._cli.audit()
+    except SystemExit as e:
+        return e.code if e.code is not None else 0
+    return 0
+
+
+def test_offline_end_to_end(tmp_path, capsys, monkeypatch):
+    req = tmp_path / "reqs.txt"
+    req.write_text("foo==1.0.0\nbar==2.0.0\n")
+    db = _local_db(
+        tmp_path / "db.json",
+        [_db_entry("PYSEC-0000-1", "foo", "0", "1.1.0", severity="HIGH")],
+    )
+
+    code = _run_audit(
+        monkeypatch,
+        [
+            "--offline",
+            "--local-db",
+            str(db),
+            "-r",
+            str(req),
+            "-f",
+            "json",
+            "--progress-spinner",
+            "off",
+        ],
+    )
+
+    # Vulnerabilities were found, so the exit code is 1.
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "Found 1 known vulnerability in 1 package" in captured.err
+
+    report = json.loads(captured.out)
+    deps = {d["name"]: d for d in report["dependencies"]}
+    # The offline report has the same structure as an online one, with the
+    # severity label passed through verbatim.
+    assert deps["foo"]["vulns"][0]["id"] == "PYSEC-0000-1"
+    assert deps["foo"]["vulns"][0]["severity"] == "HIGH"
+    assert deps["foo"]["vulns"][0]["fix_versions"] == ["1.1.0"]
+    assert deps["bar"]["vulns"] == []
+
+
+def test_offline_missing_database_degrades(tmp_path, capsys, monkeypatch):
+    req = tmp_path / "reqs.txt"
+    req.write_text("foo==1.0.0\n")
+
+    code = _run_audit(
+        monkeypatch,
+        [
+            "--offline",
+            "--local-db",
+            str(tmp_path / "missing.json"),
+            "-r",
+            str(req),
+            "-f",
+            "json",
+            "--progress-spinner",
+            "off",
+        ],
+    )
+
+    # Degraded mode lists dependencies without auditing them, and says so.
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "Local vulnerability database unavailable" in captured.err
+    report = json.loads(captured.out)
+    (dep,) = report["dependencies"]
+    assert dep["name"] == "foo"
+    assert "not audited" in dep["skip_reason"]
+
+
+def test_offline_requires_local_db(monkeypatch):
+    code = _run_audit(monkeypatch, ["--offline"])
+    assert code == 2  # argparse usage error
+
+
+def test_offline_truncated_database_fails_without_report(tmp_path, capsys, monkeypatch):
+    req = tmp_path / "reqs.txt"
+    req.write_text("foo==1.0.0\n")
+    db = _local_db(tmp_path / "db.json", [_db_entry("PYSEC-0000-1", "foo", "0", "1.1.0")])
+    # Truncate the database file.
+    raw = db.read_text()
+    db.write_text(raw[: len(raw) // 2])
+
+    output = tmp_path / "report.json"
+    code = _run_audit(
+        monkeypatch,
+        [
+            "--offline",
+            "--local-db",
+            str(db),
+            "-r",
+            str(req),
+            "-f",
+            "json",
+            "-o",
+            str(output),
+            "--progress-spinner",
+            "off",
+        ],
+    )
+
+    # A truncated database is a hard failure, and no half-finished report
+    # is left behind at the official output path.
+    assert code == 1
+    assert not output.exists()
+
+
+def test_offline_write_failure_preserves_partial(tmp_path, monkeypatch):
+    output = tmp_path / "report.json"
+
+    real_replace = os.replace
+
+    def flaky_replace(src, dst):
+        # The atomic rename into place fails (e.g. disk full); the
+        # best-effort preservation rename succeeds.
+        if Path(dst) == output:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(pip_audit._cli.os, "replace", flaky_replace)
+
+    with pytest.raises(SystemExit) as excinfo:
+        pip_audit._cli._write_output(output, '{"dependencies": []}')
+
+    assert excinfo.value.code == 1
+    # The official report path was never populated, but the completed
+    # content is preserved for forensics.
+    assert not output.exists()
+    partial = tmp_path / "report.json.partial"
+    assert partial.read_text() == '{"dependencies": []}\n'
+
+
+def test_offline_stale_database_warns(tmp_path, caplog, monkeypatch):
+    req = tmp_path / "reqs.txt"
+    req.write_text("foo==1.0.0\n")
+    db = _local_db(
+        tmp_path / "db.json",
+        [],
+        generated_at=(datetime.now() - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+    with caplog.at_level("WARNING", logger="pip_audit"):
+        code = _run_audit(
+            monkeypatch,
+            [
+                "--offline",
+                "--local-db",
+                str(db),
+                "-r",
+                str(req),
+                "--progress-spinner",
+                "off",
+            ],
+        )
+
+    assert code == 0
+    assert any("stale" in r.getMessage() for r in caplog.records)
 
 
 class TestOutputFormatChoice:

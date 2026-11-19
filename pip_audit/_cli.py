@@ -9,10 +9,10 @@ import enum
 import logging
 import os
 import sys
-from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack
+from datetime import timedelta
 from pathlib import Path
-from typing import IO, NoReturn, cast
+from typing import NoReturn, cast
 
 from pip_audit import __version__
 from pip_audit._audit import AuditOptions, Auditor
@@ -37,10 +37,12 @@ from pip_audit._service.interface import ConnectionError as VulnServiceConnectio
 from pip_audit._service.interface import (
     Dependency,
     ResolvedDependency,
+    ServiceError,
     SkippedDependency,
     VulnerabilityResult,
     VulnerabilityService,
 )
+from pip_audit._service.local import DEFAULT_MAX_DB_AGE, LocalService
 from pip_audit._state import AuditSpinner, AuditState
 from pip_audit._util import assert_never
 
@@ -53,18 +55,38 @@ package_logger = logging.getLogger("pip_audit")
 package_logger.setLevel(os.environ.get("PIP_AUDIT_LOGLEVEL", "INFO").upper())
 
 
-@contextmanager
-def _output_io(name: Path) -> Iterator[IO[str]]:  # pragma: no cover
+def _write_output(name: Path, text: str) -> None:
     """
-    A context managing wrapper for pip-audit's `--output` flag. This allows us
-    to avoid `argparse.FileType`'s "eager" file creation, which is generally
-    the wrong/unexpected behavior when dealing with fallible processes.
+    Write the audit report to the destination selected by `--output`.
+
+    File outputs are written to a temporary sibling and atomically renamed
+    into place, so a failed run never leaves a half-written report at the
+    official output path. If the write itself fails (e.g. the disk is full),
+    the partial content is preserved at a `.partial` path and a clear error
+    is reported.
     """
     if str(name) in {"stdout", "-"}:
-        yield sys.stdout
-    else:
-        with name.open("w") as io:
-            yield io
+        print(text, file=sys.stdout)
+        return
+
+    tmp = name.with_name(name.name + ".tmp")
+    try:
+        with tmp.open("w") as io:
+            io.write(text)
+            io.write("\n")
+            io.flush()
+            os.fsync(io.fileno())
+        os.replace(tmp, name)
+    except OSError as e:
+        # Preserve whatever was written for forensics, but never at the
+        # official output path.
+        partial = name.with_name(name.name + ".partial")
+        try:
+            os.replace(tmp, partial)
+            partial_msg = f"; partial output preserved at {partial}"
+        except OSError:
+            partial_msg = ""
+        _fatal(f"could not write audit report to {name}: {e}{partial_msg}")
 
 
 @enum.unique
@@ -391,6 +413,29 @@ def _parser() -> argparse.ArgumentParser:  # pragma: no cover
         "this can only be used with hashed requirements files or if the `--no-deps` flag has been "
         "provided",
     )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="audit offline, matching dependencies against a local vulnerability "
+        "database (see `--local-db`) instead of a network service",
+    )
+    parser.add_argument(
+        "--local-db",
+        type=Path,
+        metavar="FILE",
+        dest="local_db",
+        default=os.environ.get("PIP_AUDIT_LOCAL_DB"),
+        help="path to the local vulnerability database to use with `--offline`",
+    )
+    parser.add_argument(
+        "--local-db-max-age",
+        type=int,
+        metavar="DAYS",
+        dest="local_db_max_age",
+        default=int(os.environ.get("PIP_AUDIT_LOCAL_DB_MAX_AGE", DEFAULT_MAX_DB_AGE.days)),
+        help="maximum age of the local vulnerability database, in days, before "
+        "audit results are flagged as potentially outdated",
+    )
     return parser
 
 
@@ -446,7 +491,21 @@ def audit() -> None:  # pragma: no cover
     args = _parse_args(parser)
 
     service: VulnerabilityService
-    if args.vulnerability_service is VulnerabilityServiceChoice.Osv:
+    if args.offline:
+        if args.local_db is None:
+            parser.error("The --offline flag requires --local-db")
+        if args.fix:
+            parser.error("The --fix flag cannot be used in offline mode")
+        if args.vulnerability_service is not VulnerabilityServiceChoice.Pypi:
+            logger.warning("the --vulnerability-service flag is ignored in offline mode")
+        try:
+            service = LocalService(
+                Path(args.local_db), max_db_age=timedelta(days=args.local_db_max_age)
+            )
+        except ServiceError as e:
+            # An unreadable or corrupt local database is a hard failure.
+            _fatal(str(e))
+    elif args.vulnerability_service is VulnerabilityServiceChoice.Osv:
         service = OsvService(cache_dir=args.cache_dir, timeout=args.timeout, osv_url=args.osv_url)
     elif args.vulnerability_service is VulnerabilityServiceChoice.Pypi:
         service = PyPIService(cache_dir=args.cache_dir, timeout=args.timeout)
@@ -509,12 +568,22 @@ def audit() -> None:  # pragma: no cover
                 if not req.exists():
                     _fatal(f"invalid requirements input: {req}")
 
+            if args.offline:
+                # Offline mode cannot resolve dependencies over the network,
+                # so requirements files are treated as pre-resolved and any
+                # unparseable or unpinned constraint is reported individually
+                # instead of failing the whole batch.
+                logger.info(
+                    "offline mode: requirements are treated as pre-resolved; "
+                    "unpinned requirements will be skipped individually"
+                )
             source = RequirementSource(
                 args.requirements,
                 require_hashes=args.require_hashes,
-                no_deps=args.no_deps,
-                disable_pip=args.disable_pip,
+                no_deps=args.no_deps or args.offline,
+                disable_pip=args.disable_pip or args.offline,
                 skip_editable=args.skip_editable,
+                skip_invalid=args.offline,
                 index_url=args.index_url,
                 extra_index_urls=args.extra_index_urls,
                 state=state,
@@ -581,6 +650,10 @@ def audit() -> None:  # pragma: no cover
                 "Tip: your network may be blocking this service. "
                 "Try another service with `-s SERVICE`"
             )
+        except ServiceError as e:
+            # A failed audit must never produce a partial report: the error
+            # is fatal and no output is written.
+            _fatal(str(e))
 
         # If the `--fix` flag has been applied, find a set of suitable fix versions and upgrade the
         # dependencies at the source
@@ -632,12 +705,17 @@ def audit() -> None:  # pragma: no cover
                 f"{'package' if fixed_pkg_count == 1 else 'packages'}"
             )
         print(summary_msg, file=sys.stderr)
-        with _output_io(args.output) as io:
-            print(formatter.format(result, fixes), file=io)
+        _write_output(args.output, formatter.format(result, fixes))
         if pkg_count != fixed_pkg_count:
             sys.exit(1)
     else:
-        summary_msg = "No known vulnerabilities found"
+        if isinstance(service, LocalService) and service.degraded:
+            summary_msg = (
+                "Local vulnerability database unavailable; "
+                "dependencies listed without being audited"
+            )
+        else:
+            summary_msg = "No known vulnerabilities found"
         if vuln_ignore_count:
             summary_msg += f", {vuln_ignore_count} ignored"
 
@@ -648,5 +726,4 @@ def audit() -> None:  # pragma: no cover
         # If our output format is a "manifest" format we always emit it,
         # even if nothing other than a dependency summary is present.
         if skip_count > 0 or formatter.is_manifest:
-            with _output_io(args.output) as io:
-                print(formatter.format(result, fixes), file=io)
+            _write_output(args.output, formatter.format(result, fixes))

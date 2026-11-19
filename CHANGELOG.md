@@ -8,6 +8,18 @@ All versions prior to 0.0.9 are untracked.
 
 ## [Unreleased]
 
+### Added
+
+* Added an offline audit mode: with `--offline --local-db FILE`, dependencies
+  are matched against a local vulnerability database (OSV-schema JSON)
+  instead of a network service. Offline mode validates the database before
+  use (a truncated or corrupt database is a hard error, never an empty
+  result), flags conclusions from stale databases, degrades to
+  "list dependencies only" when the database is missing, reports
+  unparseable requirement constraints individually instead of failing the
+  batch, and deduplicates dependencies across multiple requirements files
+  while retaining their origin manifests
+
 ### Fixed
 
 * Editable requirements skipped with `--skip-editable` no longer require a hash

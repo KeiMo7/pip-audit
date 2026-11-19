@@ -11,7 +11,9 @@ from .interface import (
     SkippedDependency,
     VulnerabilityResult,
     VulnerabilityService,
+    severity_rank,
 )
+from .local import LocalDatabaseError, LocalService
 from .osv import OsvService
 from .pypi import PyPIService
 
@@ -19,6 +21,8 @@ __all__ = [
     "EcosystemsService",
     "ConnectionError",
     "Dependency",
+    "LocalDatabaseError",
+    "LocalService",
     "ResolvedDependency",
     "ServiceError",
     "SkippedDependency",
@@ -26,4 +30,5 @@ __all__ = [
     "VulnerabilityService",
     "OsvService",
     "PyPIService",
+    "severity_rank",
 ]

@@ -32,6 +32,7 @@ with support from Google, and is currently maintained under the
   * [Environment variables](#environment-variables)
   * [Exit codes](#exit-codes)
   * [Dry runs](#dry-runs)
+  * [Offline audits](#offline-audits)
 * [Examples](#examples)
 * [Troubleshooting](#troubleshooting)
 * [Tips and Tricks](#tips-and-tricks)
@@ -135,15 +136,15 @@ python -m pip_audit --help
 
 <!-- @begin-pip-audit-help@ -->
 ```
-usage: pip-audit [-h] [-V] [-l] [-r REQUIREMENT] [--locked] [-f FORMAT]
-                 [-s SERVICE] [--osv-url OSV_URL] [-d] [-S]
-                 [--desc [{on,off,auto}]] [--aliases [{on,off,auto}]]
-                 [--cache-dir CACHE_DIR] [--progress-spinner {on,off}]
-                 [--timeout TIMEOUT] [--path PATH] [-v] [--fix]
-                 [--require-hashes] [--index-url INDEX_URL]
+usage: pip-audit [-h] [-V] [-l] [--locked] [-f FORMAT] [-s SERVICE]
+                 [--osv-url OSV_URL] [-d] [-S] [--desc [{on,off,auto}]]
+                 [--aliases [{on,off,auto}]] [--cache-dir CACHE_DIR]
+                 [--progress-spinner {on,off}] [--timeout TIMEOUT] [-v]
+                 [--fix] [--require-hashes] [--index-url INDEX_URL]
                  [--extra-index-url URL] [--skip-editable] [--no-deps]
-                 [-o FILE] [--ignore-vuln ID] [--disable-pip]
-                 [project_path]
+                 [-o FILE] [--ignore-vuln ID] [--disable-pip] [--offline]
+                 [--local-db FILE] [--local-db-max-age DAYS]
+                 [-r REQUIREMENT | --path PATH | project_path]
 
 audit the Python environment for dependencies with known vulnerabilities
 
@@ -156,17 +157,16 @@ options:
   -V, --version         show program's version number and exit
   -l, --local           show only results for dependencies in the local
                         environment (default: False)
-  -r REQUIREMENT, --requirement REQUIREMENT
+  -r, --requirement REQUIREMENT
                         audit the given requirements file; this option can be
                         used multiple times (default: None)
   --locked              audit lock files from the local Python project. This
                         flag only applies to auditing from project paths
                         (default: False)
-  -f FORMAT, --format FORMAT
-                        the format to emit audit results in (choices: columns,
+  -f, --format FORMAT   the format to emit audit results in (choices: columns,
                         json, cyclonedx-json, cyclonedx-xml, markdown)
                         (default: columns)
-  -s SERVICE, --vulnerability-service SERVICE
+  -s, --vulnerability-service SERVICE
                         the vulnerability service to audit dependencies
                         against (choices: osv, pypi, esms) (default: pypi)
   --osv-url OSV_URL     URL to use for the OSV API instead of the default
@@ -218,14 +218,22 @@ options:
   --no-deps             don't perform any dependency resolution; requires all
                         requirements are pinned to an exact version (default:
                         False)
-  -o FILE, --output FILE
-                        output results to the given file (default: stdout)
+  -o, --output FILE     output results to the given file (default: stdout)
   --ignore-vuln ID      ignore a specific vulnerability by its vulnerability
                         ID; this option can be used multiple times (default:
                         [])
   --disable-pip         don't use `pip` for dependency resolution; this can
                         only be used with hashed requirements files or if the
                         `--no-deps` flag has been provided (default: False)
+  --offline             audit offline, matching dependencies against a local
+                        vulnerability database (see `--local-db`) instead of a
+                        network service (default: False)
+  --local-db FILE       path to the local vulnerability database to use with
+                        `--offline` (default: None)
+  --local-db-max-age DAYS
+                        maximum age of the local vulnerability database, in
+                        days, before audit results are flagged as potentially
+                        outdated (default: 30)
 ```
 <!-- @end-pip-audit-help@ -->
 
@@ -266,6 +274,62 @@ an audit (or fix) step is actually performed.
 * In fix mode, `pip-audit --fix --dry-run` performs the auditing step and prints
   out the fix behavior (i.e., which dependencies would be upgraded or skipped)
   that *would have been performed*.
+
+### Offline audits
+
+`pip-audit` can audit without any network access by matching dependencies
+against a local vulnerability database:
+
+```bash
+pip-audit --offline --local-db ./vulndb.json -r requirements.txt
+```
+
+In offline mode:
+
+* Requirements files are treated as pre-resolved (no `pip` resolution is
+  performed, since that would require the network). Requirements that are
+  not pinned to an exact version, or that fail to parse, are reported
+  individually as skipped instead of failing the whole audit.
+* The local database is validated before use: a truncated or otherwise
+  corrupt database is a hard error, never an empty result set. If the
+  database file is missing entirely, `pip-audit` degrades to listing the
+  dependencies without auditing them, and says so in its output.
+* If the database is older than `--local-db-max-age` days (default: 30),
+  a warning is emitted, since the conclusions may be outdated.
+
+The local database is a JSON document containing OSV-schema vulnerability
+entries, plus an optional `severity` label per entry that is passed through
+to the report verbatim:
+
+```json
+{
+  "format_version": 1,
+  "generated_at": "2026-11-01T00:00:00Z",
+  "vuln_count": 1,
+  "vulns": [
+    {
+      "id": "PYSEC-0000-1",
+      "aliases": ["CVE-0000-0001"],
+      "summary": "an example vulnerability",
+      "severity": "HIGH",
+      "affected": [
+        {
+          "package": {"name": "example", "ecosystem": "PyPI"},
+          "ranges": [
+            {
+              "type": "ECOSYSTEM",
+              "events": [{"introduced": "1.0"}, {"fixed": "1.2"}]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+`vuln_count`, when present, must match the actual number of entries in
+`vulns`; a mismatch (e.g. a partially written file) is treated as corruption.
 
 ## Examples
 
