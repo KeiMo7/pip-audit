@@ -9,10 +9,12 @@ import re
 import shutil
 from collections.abc import Iterator
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import IO
 
+from packaging.markers import Marker
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import Version
@@ -28,15 +30,27 @@ from pip_audit._dependency_source import (
     DependencySourceError,
     InvalidRequirementSpecifier,
 )
+from pip_audit._environment import TargetEnvironment
 from pip_audit._fix import ResolvedFixVersion
 from pip_audit._service import Dependency
-from pip_audit._service.interface import ResolvedDependency, SkippedDependency
+from pip_audit._service.interface import (
+    ResolvedDependency,
+    SkippedDependency,
+    UnevaluatedDependency,
+)
 from pip_audit._state import AuditState
 from pip_audit._virtual_env import VirtualEnv, VirtualEnvError
 
 logger = logging.getLogger(__name__)
 
 PINNED_SPECIFIER_RE = re.compile(r"==(?P<version>.+?)$", re.VERBOSE)
+
+# Upper bound on the number of fixpoint iterations when expanding the extras
+# closure. Each iteration adds at least one previously-unrequested extra, so
+# converging needs at most as many iterations as there are distinct extras in
+# the input; exceeding this bound indicates a circular or pathologically deep
+# extras chain and is reported explicitly rather than looping forever.
+MAX_EXTRAS_CLOSURE_ITERATIONS = 64
 
 
 class RequirementSource(DependencySource):
@@ -55,6 +69,7 @@ class RequirementSource(DependencySource):
         index_url: str | None = None,
         extra_index_urls: list[str] = [],
         state: AuditState = AuditState(),
+        target_environment: TargetEnvironment | None = None,
     ) -> None:
         """
         Create a new `RequirementSource`.
@@ -80,6 +95,12 @@ class RequirementSource(DependencySource):
         `extra_index_urls` are the extra URLs of package indexes.
 
         `state` is an `AuditState` to use for state callbacks.
+
+        `target_environment` is an optional description of the environment the
+        audit targets. When supplied, environment markers are evaluated against
+        it (instead of the machine running the audit) and requirements whose
+        markers cannot be decided are reported as unevaluated. It only takes
+        effect on the pre-resolved (`disable_pip`) collection path.
         """
         self._filenames = filenames
         self._require_hashes = require_hashes
@@ -89,7 +110,18 @@ class RequirementSource(DependencySource):
         self._index_url = index_url
         self._extra_index_urls = extra_index_urls
         self.state = state
+        self._target_environment = target_environment
+        self._resolved_target_environment: TargetEnvironment | None = None
         self._dep_cache: dict[Path, set[Dependency]] = {}
+
+    @property
+    def resolved_target_environment(self) -> TargetEnvironment | None:
+        """
+        The target environment actually used for marker evaluation, including
+        the expanded extras closure. `None` if no target environment was
+        supplied or collection has not run yet.
+        """
+        return self._resolved_target_environment
 
     def collect(self) -> Iterator[Dependency]:
         """
@@ -139,6 +171,16 @@ class RequirementSource(DependencySource):
                 t.unlink()
 
     def _collect_from_files(self, filenames: list[Path]) -> Iterator[Dependency]:
+        # A target environment only has meaning on the pre-resolved
+        # collection path: the `pip`-based resolution path would silently
+        # evaluate markers against the current machine instead. Refuse to
+        # degrade rather than produce a misleading audit.
+        if self._target_environment is not None and not self._disable_pip:
+            raise RequirementSourceError(
+                "a target environment can only be used with pre-resolved "
+                "requirements (the --disable-pip flag)"
+            )
+
         # Figure out whether we have a fully resolved set of dependencies.
         reqs: list[InstallRequirement] = []
         require_hashes: bool = self._require_hashes
@@ -230,7 +272,7 @@ class RequirementSource(DependencySource):
         for req in reqs:
             if (
                 isinstance(req, InstallRequirement)
-                and (req.marker is None or req.marker.evaluate())
+                and self._marker_applies(req.marker)
                 and req.req is not None
             ):
                 duplicate_req_specifier = req_specifiers.get(req.name)
@@ -292,12 +334,82 @@ class RequirementSource(DependencySource):
                 logger.warning(f"encountered an exception during file recovery: {e}")
                 continue
 
+    def _marker_applies(self, marker: Marker | None) -> bool:
+        """
+        Decide whether a marker applies, using the target environment if one
+        was supplied and the current machine otherwise.
+
+        Unevaluable markers are conservatively treated as applicable here;
+        this helper is used on paths (like fixing) where dropping a
+        requirement would be more destructive than keeping it.
+        """
+        if marker is None:
+            return True
+        # Prefer the resolved environment (with the expanded extras closure)
+        # so that collection and fixing share a single evaluation basis.
+        target_environment = self._resolved_target_environment or self._target_environment
+        if target_environment is None:
+            return marker.evaluate()
+        evaluation = target_environment.evaluate_marker(marker)
+        return evaluation.value is not False
+
+    def _extras_closure(self, reqs: list[InstallRequirement]) -> frozenset[str]:
+        """
+        Compute the closure of extras requested by the given requirements
+        under the target environment.
+
+        Starting from the extras named in the target environment description,
+        each iteration adds the extras declared by requirements whose markers
+        hold under the extras requested so far. The process is a monotone
+        fixpoint and therefore terminates on its own; if it fails to converge
+        within `MAX_EXTRAS_CLOSURE_ITERATIONS` iterations we report the
+        anomaly explicitly instead of looping forever.
+        """
+        assert self._target_environment is not None
+        requested = set(self._target_environment.extras)
+        for _ in range(MAX_EXTRAS_CLOSURE_ITERATIONS):
+            env = replace(self._target_environment, extras=frozenset(requested))
+            expanded = set(requested)
+            for req in reqs:
+                if req.req is None or not req.extras:
+                    continue
+                if req.marker is not None:
+                    evaluation = env.evaluate_marker(req.marker)
+                    # Unevaluable requirements don't contribute their extras to
+                    # the closure; they are reported as unevaluated later on.
+                    if evaluation.value is not True:
+                        continue
+                expanded.update(canonicalize_name(extra) for extra in req.extras)
+            if expanded == requested:
+                return frozenset(expanded)
+            requested = expanded
+        raise RequirementSourceError(
+            f"extras closure did not converge within {MAX_EXTRAS_CLOSURE_ITERATIONS} "
+            "iterations: the requirements likely contain a circular or "
+            "pathologically deep extras chain"
+        )
+
     def _collect_preresolved_deps(
         self, reqs: Iterator[InstallRequirement], require_hashes: bool
     ) -> Iterator[Dependency]:
         """
         Collect pre-resolved (pinned) dependencies.
         """
+        reqs = list(reqs)
+
+        # When a target environment is supplied, all marker evaluation happens
+        # against it (never against the machine running the audit), and the
+        # extras closure is expanded so that optional dependencies are
+        # included exactly when the target environment requests them.
+        target_environment = self._target_environment
+        if target_environment is not None:
+            closure = self._extras_closure(reqs)
+            target_environment = replace(target_environment, extras=closure)
+            self._resolved_target_environment = target_environment
+            logger.info(
+                f"evaluating markers against target environment: {target_environment.describe()}"
+            )
+
         req_specifiers: dict[str, SpecifierSet] = {}
         for req in reqs:
             if self._skip_editable and req.is_editable:
@@ -320,10 +432,26 @@ class RequirementSource(DependencySource):
                     skip_reason="could not deduce package version from URL requirement",
                 )
                 continue
-            if req.marker is not None and not req.marker.evaluate():
-                # TODO(ww): Remove this `no cover` pragma once we're 3.10+.
-                # See: https://github.com/nedbat/coveragepy/issues/198
-                continue  # pragma: no cover
+            if req.marker is not None:
+                if target_environment is None:
+                    if not req.marker.evaluate():
+                        # TODO(ww): Remove this `no cover` pragma once we're 3.10+.
+                        # See: https://github.com/nedbat/coveragepy/issues/198
+                        continue  # pragma: no cover
+                else:
+                    evaluation = target_environment.evaluate_marker(req.marker)
+                    if evaluation.is_unevaluated:
+                        # A marker we cannot decide must not be silently
+                        # treated as true or false: surface it as its own
+                        # category and keep going with the remaining
+                        # requirements.
+                        yield UnevaluatedDependency(
+                            name=req.name,
+                            unevaluated_reason=evaluation.reason or "marker could not be evaluated",
+                        )
+                        continue
+                    if not evaluation.value:
+                        continue
 
             duplicate_req_specifier = req_specifiers.get(req.name)
 

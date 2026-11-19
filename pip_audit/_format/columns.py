@@ -101,13 +101,19 @@ class ColumnsFormat(VulnerabilityFormat):
                 next((f for f in fixes if f.dep == dep), None),
             )
             for dep, vulns in result.items()
-            if not dep.is_skipped()
+            if not dep.is_skipped() and not dep.is_unevaluated()
             for vuln in vulns
         ]
 
         vuln_data.extend(vuln_rows)
 
         columns_string = ""
+
+        if self.target_environment is not None:
+            # Record the environment this audit was evaluated for, so that
+            # reports produced for different environments can be compared
+            # directly.
+            columns_string = f"Target environment: {self.target_environment.describe()}"
 
         # If it's just a header, don't bother adding it to the output
         if len(vuln_data) > 1:
@@ -137,6 +143,26 @@ class ColumnsFormat(VulnerabilityFormat):
             if columns_string:
                 columns_string += "\n"
             for row in skip_strings:
+                if columns_string:
+                    columns_string += "\n"
+                columns_string += row
+
+        # Now display the dependencies whose markers could not be evaluated
+        # against the target environment, as their own category.
+        unevaluated_data = [
+            self._format_unevaluated_dep(cast(service.UnevaluatedDependency, dep))
+            for dep in result.keys()
+            if dep.is_unevaluated()
+        ]
+
+        if unevaluated_data:
+            unevaluated_data.insert(0, ["Name", "Unevaluated Reason"])
+            unevaluated_strings, sizes = tabulate(unevaluated_data)
+            unevaluated_strings.insert(1, " ".join("-" * x for x in sizes))
+
+            if columns_string:
+                columns_string += "\n"
+            for row in unevaluated_strings:
                 if columns_string:
                     columns_string += "\n"
                 columns_string += row
@@ -171,6 +197,12 @@ class ColumnsFormat(VulnerabilityFormat):
         return [
             dep.canonical_name,
             dep.skip_reason,
+        ]
+
+    def _format_unevaluated_dep(self, dep: service.UnevaluatedDependency) -> list[Any]:
+        return [
+            dep.canonical_name,
+            dep.unevaluated_reason,
         ]
 
     def _format_applied_fix(self, applied_fix: fix.FixVersion) -> str:

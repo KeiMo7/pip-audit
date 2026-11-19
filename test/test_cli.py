@@ -102,6 +102,7 @@ def test_plurals(capsys, monkeypatch, args, vuln_count, pkg_count, expected):
         (
             pretend.stub(
                 is_skipped=lambda: False,
+                is_unevaluated=lambda: False,
                 name="something" + str(i),
                 canonical_name="something" + str(i),
                 version=1,
@@ -169,6 +170,7 @@ def test_print_format(monkeypatch, vuln_count, pkg_count, skip_count, print_form
         (
             pretend.stub(
                 is_skipped=lambda: False,
+                is_unevaluated=lambda: False,
                 name="something" + str(i),
                 canonical_name="something" + str(i),
                 version=1,
@@ -189,6 +191,7 @@ def test_print_format(monkeypatch, vuln_count, pkg_count, skip_count, print_form
         (
             pretend.stub(
                 is_skipped=lambda: True,
+                is_unevaluated=lambda: False,
                 name="skipped " + str(i),
                 canonical_name="skipped " + str(i),
                 version=1,
@@ -232,3 +235,30 @@ def test_environment_variable(monkeypatch):
     assert args.output == Path("/tmp/fake")
     assert not args.progress_spinner
     assert args.vulnerability_service == VulnerabilityServiceChoice.Osv
+
+
+class TestOutputIo:
+    def test_success_writes_file(self, tmp_path):
+        target = tmp_path / "report.json"
+        with pip_audit._cli._output_io(target) as io:
+            io.write("full report")
+        assert target.read_text() == "full report"
+
+    def test_failure_leaves_no_partial_file(self, tmp_path):
+        target = tmp_path / "report.json"
+        with pytest.raises(RuntimeError, match="boom"):
+            with pip_audit._cli._output_io(target) as io:
+                io.write("partial")
+                raise RuntimeError("boom")
+        assert not target.exists()
+        # No temporary files are left behind either.
+        assert list(tmp_path.iterdir()) == []
+
+    def test_failure_preserves_existing_file(self, tmp_path):
+        target = tmp_path / "report.json"
+        target.write_text("previous report")
+        with pytest.raises(RuntimeError, match="boom"):
+            with pip_audit._cli._output_io(target) as io:
+                io.write("partial")
+                raise RuntimeError("boom")
+        assert target.read_text() == "previous report"

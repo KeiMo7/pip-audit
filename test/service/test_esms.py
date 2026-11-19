@@ -295,3 +295,16 @@ def test_esms_vuln_withdrawn(monkeypatch):
     assert logger.debug.calls == [
         pretend.call("ESMS vuln entry 'fakeid' marked as withdrawn at some-datetime")
     ]
+
+
+def test_esms_unevaluated_dep():
+    # Unevaluated dependencies never participate in vulnerability matching:
+    # the service passes them through without querying anything.
+    esms = service.EcosystemsService()
+    dep = service.UnevaluatedDependency(name="foo", unevaluated_reason="unevaluated-reason")
+    results: dict[service.Dependency, list[service.VulnerabilityResult]] = dict(
+        esms.query_all(iter([dep]))
+    )
+    assert len(results) == 1
+    assert dep in results
+    assert results[dep] == []

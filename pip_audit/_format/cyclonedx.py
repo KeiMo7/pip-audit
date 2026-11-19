@@ -30,7 +30,7 @@ def _pip_audit_result_to_bom(
     for dep, vulns in result.items():
         # TODO(alex): Is there anything interesting we can do with skipped dependencies in
         # the CycloneDX format?
-        if dep.is_skipped():
+        if dep.is_skipped() or dep.is_unevaluated():
             continue
         dep = cast(service.ResolvedDependency, dep)
 

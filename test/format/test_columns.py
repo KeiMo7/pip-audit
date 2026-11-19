@@ -3,6 +3,8 @@ import sys
 import pytest
 
 import pip_audit._format as format
+import pip_audit._service as service
+from pip_audit._environment import TargetEnvironment
 from pip_audit._format.columns import _osc8_link
 from pip_audit._format.interface import pypi_url, vuln_id_url
 
@@ -107,3 +109,30 @@ def test_columns_terminal_links(monkeypatch, vuln_data):
 {_P("foo")}  1.0     {_V("VULN-1")} 1.0          {_V("CVE-0000-00001")}
 {_P("bar")}  0.1     {_V("VULN-2")}              {_V("CVE-0000-00002")}"""
     assert columns_format.format(vuln_data, []) == expected_columns
+
+
+def test_columns_unevaluated_dep():
+    columns_format = format.ColumnsFormat(False, True)
+    result = {
+        service.UnevaluatedDependency(name="mystery", unevaluated_reason="unevaluated-reason"): [],
+    }
+    expected_columns = """Name    Unevaluated Reason
+------- ------------------
+mystery unevaluated-reason"""
+    assert columns_format.format(result, []) == expected_columns
+
+
+def test_columns_target_environment():
+    columns_format = format.ColumnsFormat(False, True)
+    columns_format.target_environment = TargetEnvironment.from_string(
+        "python_version=3.11;sys_platform=linux"
+    )
+    result = {
+        service.UnevaluatedDependency(name="mystery", unevaluated_reason="unevaluated-reason"): [],
+    }
+    expected_columns = """Target environment: python_version=3.11;sys_platform=linux
+
+Name    Unevaluated Reason
+------- ------------------
+mystery unevaluated-reason"""
+    assert columns_format.format(result, []) == expected_columns

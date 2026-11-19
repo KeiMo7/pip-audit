@@ -9,6 +9,7 @@ from .interface import (
     ResolvedDependency,
     ServiceError,
     SkippedDependency,
+    UnevaluatedDependency,
     VulnerabilityResult,
     VulnerabilityService,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "ResolvedDependency",
     "ServiceError",
     "SkippedDependency",
+    "UnevaluatedDependency",
     "VulnerabilityResult",
     "VulnerabilityService",
     "OsvService",

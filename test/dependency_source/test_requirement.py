@@ -11,14 +11,16 @@ import pretend  # type: ignore
 import pytest
 from packaging.version import Version
 
+from pip_audit._audit import Auditor
 from pip_audit._dependency_source import (
     PYPI_URL,
     DependencyFixError,
     DependencySourceError,
     requirement,
 )
+from pip_audit._environment import TargetEnvironment
 from pip_audit._fix import ResolvedFixVersion
-from pip_audit._service import ResolvedDependency, SkippedDependency
+from pip_audit._service import ResolvedDependency, SkippedDependency, UnevaluatedDependency
 from pip_audit._state import AuditState
 from pip_audit._virtual_env import VirtualEnv, VirtualEnvError
 
@@ -915,3 +917,216 @@ def test_requirement_source_disable_pip_editable_without_egg_fragment(req_file):
         )
         in specs
     )
+
+
+def _target_env(spec: str) -> TargetEnvironment:
+    return TargetEnvironment.from_string(spec)
+
+
+def test_requirement_source_target_env_marker_outcomes(req_file):
+    # A fixed manifest covering the three marker outcomes: each kind must
+    # land in its own place.
+    source = _init_requirement(
+        [
+            (
+                req_file(),
+                "flask==2.0.1\n"
+                'winonly==1.0; sys_platform == "win32"\n'
+                'pyreq==1.2; python_version >= "3.10"\n'
+                'mystery==1.0; os_name == "posix"\n',
+            )
+        ],
+        disable_pip=True,
+        no_deps=True,
+        target_environment=_target_env("python_version=3.11;sys_platform=linux"),
+    )
+
+    specs = list(source.collect())
+
+    # Markers that evaluate to true are collected as usual.
+    resolved = [s for s in specs if isinstance(s, ResolvedDependency)]
+    assert {s.name for s in resolved} == {"flask", "pyreq"}
+
+    # Markers that evaluate to false (winonly) are excluded.
+    assert "winonly" not in {s.name for s in specs}
+
+    # Markers that cannot be decided are their own category: visible and
+    # countable, with an explanatory reason, and never confused with skips.
+    unevaluated = [s for s in specs if isinstance(s, UnevaluatedDependency)]
+    assert len(unevaluated) == 1
+    assert unevaluated[0].name == "mystery"
+    assert "os_name" in unevaluated[0].unevaluated_reason
+    assert not any(isinstance(s, SkippedDependency) for s in specs)
+
+    # The source records the environment it evaluated against.
+    assert source.resolved_target_environment is not None
+    assert source.resolved_target_environment.describe() == "python_version=3.11;sys_platform=linux"
+
+
+def test_requirement_source_target_env_different_environments(req_file):
+    # The same manifest, evaluated against two different target environments,
+    # yields different but explainable dependency sets.
+    manifest = (
+        "common==3.0\n"
+        'winonly==1.0; sys_platform == "win32"\n'
+        'linonly==2.0; sys_platform == "linux"\n'
+        'legacy==4.0; python_version < "3.10"\n'
+    )
+
+    def resolved_names(env_spec):
+        source = _init_requirement(
+            [(req_file(), manifest)],
+            disable_pip=True,
+            no_deps=True,
+            target_environment=_target_env(env_spec),
+        )
+        return {s.name for s in source.collect() if isinstance(s, ResolvedDependency)}
+
+    linux_modern = resolved_names("python_version=3.11;sys_platform=linux")
+    windows_legacy = resolved_names("python_version=3.9;sys_platform=win32")
+
+    assert linux_modern == {"common", "linonly"}
+    assert windows_legacy == {"common", "winonly", "legacy"}
+    # Every difference between the two runs is explained by a marker on the
+    # corresponding requirement line.
+    assert linux_modern.symmetric_difference(windows_legacy) == {
+        "linonly",
+        "winonly",
+        "legacy",
+    }
+
+
+def test_requirement_source_target_env_deterministic(req_file):
+    # Repeating the audit under the same target environment must produce
+    # identical conclusions in an identical order.
+    manifest = (
+        "flask==2.0.1\n"
+        'winonly==1.0; sys_platform == "win32"\n'
+        'mystery==1.0; os_name == "posix"\n'
+        "base[sec]==1.0\n"
+        'secdep==2.0; extra == "sec"\n'
+    )
+
+    def collect():
+        source = _init_requirement(
+            [(req_file(), manifest)],
+            disable_pip=True,
+            no_deps=True,
+            target_environment=_target_env("python_version=3.11;sys_platform=linux"),
+        )
+        return list(source.collect())
+
+    first = collect()
+    second = collect()
+    assert first == second
+    assert [s.name for s in first] == [s.name for s in second]
+
+
+def test_requirement_source_target_env_extras_closure(req_file):
+    # Optional dependencies are expanded into a closure consistent with the
+    # target environment: extras requested transitively by included
+    # requirements are included, others are not.
+    manifest = (
+        "base[sec]==1.0\n"
+        'secdep==2.0; extra == "sec"\n'
+        'chain[two]==3.0; extra == "sec"\n'
+        'chaindep==4.0; extra == "two"\n'
+        'otherdep==5.0; extra == "other"\n'
+    )
+
+    source = _init_requirement(
+        [(req_file(), manifest)],
+        disable_pip=True,
+        no_deps=True,
+        target_environment=_target_env("python_version=3.11;sys_platform=linux"),
+    )
+    specs = list(source.collect())
+    resolved = {s.name for s in specs if isinstance(s, ResolvedDependency)}
+
+    # `base[sec]` pulls in `secdep`; `chain[two]` (included via `sec`) pulls
+    # in `chaindep`; nothing requests `other`, so `otherdep` is excluded.
+    assert resolved == {"base", "secdep", "chain", "chaindep"}
+
+    # The resolved environment records the expanded closure.
+    assert source.resolved_target_environment.extras == frozenset({"sec", "two"})
+
+
+def test_requirement_source_target_env_extras_cycle_terminates(req_file):
+    # A cycle in the extras graph terminates (the closure is a monotone
+    # fixpoint) and includes both ends of the cycle.
+    manifest = 'a[x]==1.0; extra == "y"\nb[y]==2.0; extra == "x"\nroot[y]==3.0\n'
+    source = _init_requirement(
+        [(req_file(), manifest)],
+        disable_pip=True,
+        no_deps=True,
+        target_environment=_target_env("python_version=3.11"),
+    )
+    resolved = {s.name for s in source.collect() if isinstance(s, ResolvedDependency)}
+    assert resolved == {"a", "b", "root"}
+
+
+def test_requirement_source_target_env_extras_closure_limit(req_file, monkeypatch):
+    # If the closure fails to converge within the iteration bound, the
+    # failure is reported explicitly instead of hanging.
+    monkeypatch.setattr(requirement, "MAX_EXTRAS_CLOSURE_ITERATIONS", 2)
+    manifest = (
+        "d0[e1]==1.0\n"
+        'd1[e2]==1.0; extra == "e1"\n'
+        'd2[e3]==1.0; extra == "e2"\n'
+        'd3[e4]==1.0; extra == "e3"\n'
+    )
+    source = _init_requirement(
+        [(req_file(), manifest)],
+        disable_pip=True,
+        no_deps=True,
+        target_environment=_target_env("python_version=3.11"),
+    )
+    with pytest.raises(DependencySourceError, match="extras closure did not converge"):
+        list(source.collect())
+
+
+def test_requirement_source_target_env_unevaluated_not_matched(req_file, monkeypatch):
+    # Unevaluated dependencies must not participate in vulnerability
+    # matching: the auditor never queries the service for them.
+    source = _init_requirement(
+        [(req_file(), 'mystery==1.0; os_name == "posix"\n')],
+        disable_pip=True,
+        no_deps=True,
+        target_environment=_target_env("python_version=3.11"),
+    )
+
+    class ExplodingService:
+        def query_all(self, specs):
+            for spec in specs:
+                assert spec.is_unevaluated()
+                yield spec, []
+
+    auditor = Auditor(ExplodingService())
+    results = list(auditor.audit(source))
+    assert len(results) == 1
+    dep, vulns = results[0]
+    assert isinstance(dep, UnevaluatedDependency)
+    assert vulns == []
+
+
+def test_requirement_source_without_target_env_unchanged(req_file):
+    # Without a target environment, collection behaves exactly as before:
+    # markers are evaluated against the current machine and no resolved
+    # environment is recorded.
+    source = _init_requirement([(req_file(), "flask==2.0.1")], disable_pip=True, no_deps=True)
+    specs = list(source.collect())
+    assert specs == [ResolvedDependency("flask", Version("2.0.1"))]
+    assert source.resolved_target_environment is None
+
+
+def test_requirement_source_target_env_requires_disable_pip(req_file):
+    # A target environment on the `pip`-resolution path would silently
+    # evaluate markers against the current machine; the source refuses to
+    # degrade instead.
+    source = _init_requirement(
+        [(req_file(), "flask==2.0.1")],
+        no_deps=True,
+        target_environment=_target_env("python_version=3.11"),
+    )
+    with pytest.raises(DependencySourceError, match="target environment"):
+        list(source.collect())

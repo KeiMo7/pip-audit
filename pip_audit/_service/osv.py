@@ -58,7 +58,9 @@ class OsvService(VulnerabilityService):
 
         See `VulnerabilityService.query`.
         """
-        if spec.is_skipped():
+        if spec.is_skipped() or spec.is_unevaluated():
+            # Skipped and unevaluated dependencies never participate in
+            # vulnerability matching (and never hit the network).
             return spec, []
         spec = cast(ResolvedDependency, spec)
 

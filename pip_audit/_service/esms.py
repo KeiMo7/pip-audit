@@ -59,7 +59,9 @@ class EcosystemsService(VulnerabilityService):
         """
         url = "https://advisories.ecosyste.ms/api/v1/advisories"
 
-        if spec.is_skipped():
+        if spec.is_skipped() or spec.is_unevaluated():
+            # Skipped and unevaluated dependencies never participate in
+            # vulnerability matching (and never hit the network).
             return spec, []
         spec = cast(ResolvedDependency, spec)
 

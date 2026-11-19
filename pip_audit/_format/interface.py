@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 
 import pip_audit._fix as fix
 import pip_audit._service as service
+from pip_audit._environment import TargetEnvironment
 
 
 def vuln_id_url(vuln_id: str) -> str:
@@ -23,6 +24,15 @@ def pypi_url(name: str) -> str:
 class VulnerabilityFormat(ABC):
     """
     Represents an abstract string representation for vulnerability results.
+    """
+
+    target_environment: TargetEnvironment | None = None
+    """
+    The target environment the audit was evaluated against, if any.
+
+    Formats include this in their output so that reports record which
+    environment they were evaluated for and can be compared across
+    environments. `None` preserves the pre-target-environment output.
     """
 
     @property

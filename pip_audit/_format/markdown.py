@@ -55,7 +55,13 @@ class MarkdownFormat(VulnerabilityFormat):
         Returns a Markdown formatted string representing a set of vulnerability results and applied
         fixes.
         """
-        output = self._format_vuln_results(result, fixes)
+        output = ""
+        if self.target_environment is not None:
+            # Record the environment this audit was evaluated for, so that
+            # reports produced for different environments can be compared
+            # directly.
+            output = f"Target environment: `{self.target_environment.describe()}`\n"
+        output += self._format_vuln_results(result, fixes)
         skipped_deps_output = self._format_skipped_deps(result)
         if skipped_deps_output:
             # If we wrote the results table already, we need to add some line breaks to ensure that
@@ -63,6 +69,11 @@ class MarkdownFormat(VulnerabilityFormat):
             if output:
                 output += "\n"
             output += skipped_deps_output
+        unevaluated_deps_output = self._format_unevaluated_deps(result)
+        if unevaluated_deps_output:
+            if output:
+                output += "\n"
+            output += unevaluated_deps_output
         return output
 
     def _format_vuln_results(
@@ -89,7 +100,7 @@ class MarkdownFormat(VulnerabilityFormat):
                 next((f for f in fixes if f.dep == dep), None),
             )
             for dep, vulns in result.items()
-            if not dep.is_skipped()
+            if not dep.is_skipped() and not dep.is_unevaluated()
             for vuln in vulns
         ]
 
@@ -164,3 +175,28 @@ class MarkdownFormat(VulnerabilityFormat):
 
     def _format_skipped_dep(self, dep: service.SkippedDependency) -> str:
         return f"{dep.name} | {dep.skip_reason}"
+
+    def _format_unevaluated_deps(
+        self, result: dict[service.Dependency, list[service.VulnerabilityResult]]
+    ) -> str:
+        header = "Name | Unevaluated Reason"
+        border = "--- | ---"
+
+        unevaluated_dep_rows: list[str] = []
+        for dep in result.keys():
+            if dep.is_unevaluated():
+                dep = cast(service.UnevaluatedDependency, dep)
+                unevaluated_dep_rows.append(self._format_unevaluated_dep(dep))
+
+        if not unevaluated_dep_rows:
+            return ""
+
+        return dedent(
+            f"""
+            {header}
+            {border}
+            """
+        ) + "\n".join(unevaluated_dep_rows)
+
+    def _format_unevaluated_dep(self, dep: service.UnevaluatedDependency) -> str:
+        return f"{dep.name} | {dep.unevaluated_reason}"

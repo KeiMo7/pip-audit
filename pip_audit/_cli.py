@@ -9,6 +9,7 @@ import enum
 import logging
 import os
 import sys
+import tempfile
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -24,6 +25,7 @@ from pip_audit._dependency_source import (
     RequirementSource,
 )
 from pip_audit._dependency_source.pylock import PyLockSource
+from pip_audit._environment import TargetEnvironment, TargetEnvironmentError
 from pip_audit._fix import ResolvedFixVersion, SkippedFixVersion, resolve_fix_versions
 from pip_audit._format import (
     ColumnsFormat,
@@ -38,6 +40,7 @@ from pip_audit._service.interface import (
     Dependency,
     ResolvedDependency,
     SkippedDependency,
+    UnevaluatedDependency,
     VulnerabilityResult,
     VulnerabilityService,
 )
@@ -59,12 +62,27 @@ def _output_io(name: Path) -> Iterator[IO[str]]:  # pragma: no cover
     A context managing wrapper for pip-audit's `--output` flag. This allows us
     to avoid `argparse.FileType`'s "eager" file creation, which is generally
     the wrong/unexpected behavior when dealing with fallible processes.
+
+    File outputs are written to a temporary file and atomically moved into
+    place, so that a failed report generation never leaves a partial (or
+    truncated) report behind.
     """
     if str(name) in {"stdout", "-"}:
         yield sys.stdout
     else:
-        with name.open("w") as io:
-            yield io
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            dir=str(name.parent), prefix=f".{name.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(tmp_fd, "w") as io:
+                yield io
+            os.replace(tmp_name, name)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
 
 
 @enum.unique
@@ -391,6 +409,16 @@ def _parser() -> argparse.ArgumentParser:  # pragma: no cover
         "this can only be used with hashed requirements files or if the `--no-deps` flag has been "
         "provided",
     )
+    parser.add_argument(
+        "--target-env",
+        type=str,
+        metavar="TARGET_ENV",
+        default=os.environ.get("PIP_AUDIT_TARGET_ENV"),
+        help="evaluate environment markers against the given target environment instead of the "
+        "machine running the audit; the description is a `;`-separated list of `key=value` pairs, "
+        "e.g. `python_version=3.11;sys_platform=linux;extra=security`; requires `--requirement` "
+        "and `--disable-pip`",
+    )
     return parser
 
 
@@ -476,6 +504,23 @@ def audit() -> None:  # pragma: no cover
             parser.error("The --no-deps flag can only be used with --requirement (-r)")
         elif args.disable_pip:
             parser.error("The --disable-pip flag can only be used with --requirement (-r)")
+        elif args.target_env:
+            parser.error("The --target-env flag can only be used with --requirement (-r)")
+
+    # Parse the target environment description up front: an invalid
+    # description is a hard error and must never degrade into evaluating
+    # markers against the machine running the audit.
+    target_environment: TargetEnvironment | None = None
+    if args.target_env is not None:
+        try:
+            target_environment = TargetEnvironment.from_string(args.target_env)
+        except TargetEnvironmentError as e:
+            _fatal(f"invalid --target-env description: {e}")
+        if not args.disable_pip:
+            parser.error(
+                "The --target-env flag requires --disable-pip: marker evaluation against a "
+                "target environment is only supported for pre-resolved requirements"
+            )
 
     # Nudge users to consider alternate workflows.
     if args.require_hashes and args.no_deps:
@@ -518,6 +563,7 @@ def audit() -> None:  # pragma: no cover
                 index_url=args.index_url,
                 extra_index_urls=args.extra_index_urls,
                 state=state,
+                target_environment=target_environment,
             )
         elif args.project_path is not None:
             # NOTE: We'll probably want to support --skip-editable here,
@@ -548,11 +594,22 @@ def audit() -> None:  # pragma: no cover
         pkg_count = 0
         vuln_count = 0
         skip_count = 0
+        unevaluated_count = 0
         vuln_ignore_count = 0
         vulns_to_ignore = set(args.ignore_vulns)
         try:
             for spec, vulns in auditor.audit(source):
-                if spec.is_skipped():
+                if spec.is_unevaluated():
+                    # Unevaluated dependencies are their own category: they
+                    # don't participate in vulnerability matching, but they
+                    # remain visible and countable in the report.
+                    spec = cast(UnevaluatedDependency, spec)
+                    if args.strict:
+                        _fatal(f"{spec.name}: {spec.unevaluated_reason}")
+                    else:
+                        state.update_state(f"Unevaluated {spec.name}: {spec.unevaluated_reason}")
+                    unevaluated_count += 1
+                elif spec.is_skipped():
                     spec = cast(SkippedDependency, spec)
                     if args.strict:
                         _fatal(f"{spec.name}: {spec.skip_reason}")
@@ -613,6 +670,16 @@ def audit() -> None:  # pragma: no cover
                         fix = SkippedFixVersion(fix.dep, skip_reason)
                 fixes.append(fix)
 
+    # Record the environment the audit was evaluated against in the report,
+    # so that reports produced for different environments can be compared
+    # directly. Prefer the source's resolved environment (which includes the
+    # expanded extras closure) over the user-supplied description.
+    if target_environment is not None:
+        resolved = (
+            source.resolved_target_environment if isinstance(source, RequirementSource) else None
+        )
+        formatter.target_environment = resolved or target_environment
+
     if vuln_count > 0:
         if vuln_ignore_count:
             ignored = f", ignored {vuln_ignore_count}"
@@ -640,6 +707,11 @@ def audit() -> None:  # pragma: no cover
         summary_msg = "No known vulnerabilities found"
         if vuln_ignore_count:
             summary_msg += f", {vuln_ignore_count} ignored"
+        if unevaluated_count:
+            summary_msg += (
+                f", {unevaluated_count} "
+                f"{'dependency' if unevaluated_count == 1 else 'dependencies'} unevaluated"
+            )
 
         print(
             summary_msg,
@@ -647,6 +719,6 @@ def audit() -> None:  # pragma: no cover
         )
         # If our output format is a "manifest" format we always emit it,
         # even if nothing other than a dependency summary is present.
-        if skip_count > 0 or formatter.is_manifest:
+        if skip_count > 0 or unevaluated_count > 0 or formatter.is_manifest:
             with _output_io(args.output) as io:
                 print(formatter.format(result, fixes), file=io)

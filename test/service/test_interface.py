@@ -9,6 +9,7 @@ from pip_audit._service.interface import (
     Dependency,
     ResolvedDependency,
     SkippedDependency,
+    UnevaluatedDependency,
     VulnerabilityID,
     VulnerabilityResult,
     VulnerabilityService,
@@ -16,8 +17,12 @@ from pip_audit._service.interface import (
 
 
 def test_dependency_typing():
-    # there are only two subclasses of Dependency
-    assert set(Dependency.__subclasses__()) == {ResolvedDependency, SkippedDependency}
+    # there are only three subclasses of Dependency
+    assert set(Dependency.__subclasses__()) == {
+        ResolvedDependency,
+        SkippedDependency,
+        UnevaluatedDependency,
+    }
 
     # Dependency itself cannot be initialized
     with pytest.raises(NotImplementedError):
@@ -27,11 +32,19 @@ def test_dependency_typing():
     assert r.name == "foo"
     assert r.canonical_name == "foo"
     assert not r.is_skipped()
+    assert not r.is_unevaluated()
 
     s = SkippedDependency(name="bar", skip_reason="unit test")
     assert s.name == "bar"
     assert s.canonical_name == "bar"
     assert s.is_skipped()
+    assert not s.is_unevaluated()
+
+    u = UnevaluatedDependency(name="baz", unevaluated_reason="unit test")
+    assert u.name == "baz"
+    assert u.canonical_name == "baz"
+    assert not u.is_skipped()
+    assert u.is_unevaluated()
 
 
 def test_vulnerability_service(vuln_service, spec):

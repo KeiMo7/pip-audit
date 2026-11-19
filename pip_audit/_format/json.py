@@ -50,15 +50,27 @@ class JsonFormat(VulnerabilityFormat):
 
         See `VulnerabilityFormat.format`.
         """
-        output_json = {
-            "dependencies": [self._format_dep(dep, vulns) for dep, vulns in result.items()],
-            "fixes": [self._format_fix(f) for f in fixes],
-        }
+        output_json: dict[str, Any] = {}
+        if self.target_environment is not None:
+            # Record the environment this audit was evaluated for, so that
+            # reports produced for different environments can be compared
+            # directly.
+            output_json["target_environment"] = self.target_environment.as_report_dict()
+        output_json["dependencies"] = [
+            self._format_dep(dep, vulns) for dep, vulns in result.items()
+        ]
+        output_json["fixes"] = [self._format_fix(f) for f in fixes]
         return json.dumps(output_json)
 
     def _format_dep(
         self, dep: service.Dependency, vulns: list[service.VulnerabilityResult]
     ) -> dict[str, Any]:
+        if dep.is_unevaluated():
+            dep = cast(service.UnevaluatedDependency, dep)
+            return {
+                "name": dep.canonical_name,
+                "unevaluated_reason": dep.unevaluated_reason,
+            }
         if dep.is_skipped():
             dep = cast(service.SkippedDependency, dep)
             return {

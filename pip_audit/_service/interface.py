@@ -60,6 +60,16 @@ class Dependency:
         """
         return self.__class__ is SkippedDependency
 
+    def is_unevaluated(self) -> bool:
+        """
+        Check whether the `Dependency`'s environment markers could not be
+        evaluated against the target environment.
+
+        Unevaluated dependencies never participate in vulnerability matching,
+        but they are reported (and counted) separately from skipped ones.
+        """
+        return self.__class__ is UnevaluatedDependency
+
 
 @dataclass(frozen=True)
 class ResolvedDependency(Dependency):
@@ -77,6 +87,19 @@ class SkippedDependency(Dependency):
     """
 
     skip_reason: str
+
+
+@dataclass(frozen=True)
+class UnevaluatedDependency(Dependency):
+    """
+    Represents a Python package whose environment markers could not be
+    evaluated against the target environment.
+
+    Unevaluated dependencies are excluded from vulnerability matching, but
+    remain visible (and countable) in audit reports.
+    """
+
+    unevaluated_reason: str
 
 
 @dataclass(frozen=True)

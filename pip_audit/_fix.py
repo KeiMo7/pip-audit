@@ -73,7 +73,7 @@ def resolve_fix_versions(
     known vulnerabilities.
     """
     for dep, vulns in result.items():
-        if dep.is_skipped():
+        if dep.is_skipped() or dep.is_unevaluated():
             continue
         if not vulns:
             continue
