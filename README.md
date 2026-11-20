@@ -136,7 +136,8 @@ python -m pip_audit --help
 <!-- @begin-pip-audit-help@ -->
 ```
 usage: pip-audit [-h] [-V] [-l] [-r REQUIREMENT] [--locked] [-f FORMAT]
-                 [-s SERVICE] [--osv-url OSV_URL] [-d] [-S]
+                 [-s SERVICE] [--extra-vulnerability-service SERVICE]
+                 [--osv-url OSV_URL] [-d] [-S]
                  [--desc [{on,off,auto}]] [--aliases [{on,off,auto}]]
                  [--cache-dir CACHE_DIR] [--progress-spinner {on,off}]
                  [--timeout TIMEOUT] [--path PATH] [-v] [--fix]
@@ -169,6 +170,11 @@ options:
   -s SERVICE, --vulnerability-service SERVICE
                         the vulnerability service to audit dependencies
                         against (choices: osv, pypi, esms) (default: pypi)
+  --extra-vulnerability-service SERVICE
+                        an additional vulnerability service to audit
+                        dependencies against; results from all services are
+                        merged. This option can be used multiple times
+                        (choices: osv, pypi, esms) (default: [])
   --osv-url OSV_URL     URL to use for the OSV API instead of the default
                         (default: https://api.osv.dev/v1/query)
   -d, --dry-run         without `--fix`: collect all dependencies but do not
@@ -251,6 +257,9 @@ The current codes are:
 
 * `0`: No known vulnerabilities were detected.
 * `1`: One or more known vulnerabilities were found.
+* `2`: The audit is incomplete: one or more vulnerability services failed,
+  and the results are partial. This is combined with `1` (i.e. exit code `3`)
+  when vulnerabilities were also found.
 
 `pip-audit`'s exit code cannot be suppressed.
 See [Suppressing exit codes from `pip-audit`](#suppressing-exit-codes-from-pip-audit)

@@ -12,6 +12,7 @@ from .interface import (
     VulnerabilityResult,
     VulnerabilityService,
 )
+from .merged import MergedVulnerabilityService
 from .osv import OsvService
 from .pypi import PyPIService
 
@@ -19,6 +20,7 @@ __all__ = [
     "EcosystemsService",
     "ConnectionError",
     "Dependency",
+    "MergedVulnerabilityService",
     "ResolvedDependency",
     "ServiceError",
     "SkippedDependency",

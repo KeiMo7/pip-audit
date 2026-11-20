@@ -32,7 +32,13 @@ from pip_audit._format import (
     MarkdownFormat,
     VulnerabilityFormat,
 )
-from pip_audit._service import EcosystemsService, OsvService, PyPIService
+from pip_audit._service import (
+    EcosystemsService,
+    MergedVulnerabilityService,
+    OsvService,
+    PyPIService,
+    ServiceError,
+)
 from pip_audit._service.interface import ConnectionError as VulnServiceConnectionError
 from pip_audit._service.interface import (
     Dependency,
@@ -249,6 +255,20 @@ def _parser() -> argparse.ArgumentParser:  # pragma: no cover
         ),
     )
     parser.add_argument(
+        "--extra-vulnerability-service",
+        type=VulnerabilityServiceChoice,
+        choices=VulnerabilityServiceChoice,
+        action="append",
+        dest="extra_vulnerability_services",
+        default=[],
+        metavar="SERVICE",
+        help=_enum_help(
+            "an additional vulnerability service to audit dependencies against; "
+            "results from all services are merged. This option can be used multiple times",
+            VulnerabilityServiceChoice,
+        ),
+    )
+    parser.add_argument(
         "--osv-url",
         type=str,
         metavar="OSV_URL",
@@ -438,6 +458,19 @@ def _dep_source_from_project_path(
     _fatal(f"couldn't find a supported project file in {project_path}")
 
 
+def _service_from_choice(
+    choice: VulnerabilityServiceChoice, args: argparse.Namespace
+) -> VulnerabilityService:  # pragma: no cover
+    if choice is VulnerabilityServiceChoice.Osv:
+        return OsvService(cache_dir=args.cache_dir, timeout=args.timeout, osv_url=args.osv_url)
+    elif choice is VulnerabilityServiceChoice.Pypi:
+        return PyPIService(cache_dir=args.cache_dir, timeout=args.timeout)
+    elif choice is VulnerabilityServiceChoice.Esms:
+        return EcosystemsService(cache_dir=args.cache_dir, timeout=args.timeout)
+    else:
+        assert_never(choice)  # pragma: no cover
+
+
 def audit() -> None:  # pragma: no cover
     """
     The primary entrypoint for `pip-audit`.
@@ -445,15 +478,24 @@ def audit() -> None:  # pragma: no cover
     parser = _parser()
     args = _parse_args(parser)
 
+    # Build the list of vulnerability services to audit against. With a
+    # single service (the default), the behavior is exactly the historical
+    # single-source behavior; with additional services, results are merged
+    # field-by-field across all sources.
+    service_choices = [args.vulnerability_service]
+    for extra in args.extra_vulnerability_services:
+        if extra not in service_choices:
+            service_choices.append(extra)
+        else:
+            logger.warning(f"Ignoring duplicate vulnerability service: {extra}")
+
     service: VulnerabilityService
-    if args.vulnerability_service is VulnerabilityServiceChoice.Osv:
-        service = OsvService(cache_dir=args.cache_dir, timeout=args.timeout, osv_url=args.osv_url)
-    elif args.vulnerability_service is VulnerabilityServiceChoice.Pypi:
-        service = PyPIService(cache_dir=args.cache_dir, timeout=args.timeout)
-    elif args.vulnerability_service is VulnerabilityServiceChoice.Esms:
-        service = EcosystemsService(cache_dir=args.cache_dir, timeout=args.timeout)
+    if len(service_choices) == 1:
+        service = _service_from_choice(service_choices[0], args)
     else:
-        assert_never(args.vulnerability_service)  # pragma: no cover
+        service = MergedVulnerabilityService(
+            [(str(choice), _service_from_choice(choice, args)) for choice in service_choices]
+        )
 
     output_desc = args.desc.to_bool(args.format)
     output_aliases = args.aliases.to_bool(args.format)
@@ -481,7 +523,7 @@ def audit() -> None:  # pragma: no cover
     if args.require_hashes and args.no_deps:
         logger.warning("The --no-deps flag is redundant when used with --require-hashes")
 
-    if args.require_hashes and isinstance(service, OsvService):
+    if args.require_hashes and args.vulnerability_service is VulnerabilityServiceChoice.Osv:
         logger.warning(
             "The --require-hashes flag with --service osv only enforces hash presence NOT hash "
             "validity. Use --service pypi to enforce hash validity."
@@ -581,6 +623,10 @@ def audit() -> None:  # pragma: no cover
                 "Tip: your network may be blocking this service. "
                 "Try another service with `-s SERVICE`"
             )
+        except ServiceError as e:
+            # Every configured vulnerability service failed: fail explicitly
+            # rather than reporting a potentially empty audit.
+            _fatal(str(e))
 
         # If the `--fix` flag has been applied, find a set of suitable fix versions and upgrade the
         # dependencies at the source
@@ -613,6 +659,20 @@ def audit() -> None:  # pragma: no cover
                         fix = SkippedFixVersion(fix.dep, skip_reason)
                 fixes.append(fix)
 
+    # If any vulnerability source failed, the audit is partial: say so in the
+    # summary and reflect it in the exit code.
+    partial = isinstance(service, MergedVulnerabilityService) and service.partial
+    partial_msg = ""
+    exit_code = 0
+    if partial:
+        merged_service = cast(MergedVulnerabilityService, service)
+        failed = ", ".join(merged_service.failed_sources)
+        partial_msg = f" (partial results; failed services: {failed})"
+        logger.warning(
+            f"Audit is incomplete; the following vulnerability services failed: {failed}"
+        )
+        exit_code |= 2
+
     if vuln_count > 0:
         if vuln_ignore_count:
             ignored = f", ignored {vuln_ignore_count}"
@@ -631,15 +691,17 @@ def audit() -> None:  # pragma: no cover
                 f"in {fixed_pkg_count} "
                 f"{'package' if fixed_pkg_count == 1 else 'packages'}"
             )
+        summary_msg += partial_msg
         print(summary_msg, file=sys.stderr)
         with _output_io(args.output) as io:
             print(formatter.format(result, fixes), file=io)
         if pkg_count != fixed_pkg_count:
-            sys.exit(1)
+            exit_code |= 1
     else:
         summary_msg = "No known vulnerabilities found"
         if vuln_ignore_count:
             summary_msg += f", {vuln_ignore_count} ignored"
+        summary_msg += partial_msg
 
         print(
             summary_msg,
@@ -650,3 +712,6 @@ def audit() -> None:  # pragma: no cover
         if skip_count > 0 or formatter.is_manifest:
             with _output_io(args.output) as io:
                 print(formatter.format(result, fixes), file=io)
+
+    if exit_code:
+        sys.exit(exit_code)

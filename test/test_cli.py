@@ -232,3 +232,36 @@ def test_environment_variable(monkeypatch):
     assert args.output == Path("/tmp/fake")
     assert not args.progress_spinner
     assert args.vulnerability_service == VulnerabilityServiceChoice.Osv
+
+
+def test_extra_vulnerability_service(monkeypatch):
+    parser = pip_audit._cli._parser()
+    monkeypatch.setattr(
+        pip_audit._cli,
+        "_parse_args",
+        lambda *a: parser.parse_args(
+            [
+                "-s",
+                "pypi",
+                "--extra-vulnerability-service",
+                "osv",
+                "--extra-vulnerability-service",
+                "esms",
+            ]
+        ),
+    )
+    args = pip_audit._cli._parse_args(parser, [])
+
+    assert args.vulnerability_service == VulnerabilityServiceChoice.Pypi
+    assert args.extra_vulnerability_services == [
+        VulnerabilityServiceChoice.Osv,
+        VulnerabilityServiceChoice.Esms,
+    ]
+
+
+def test_extra_vulnerability_service_defaults_to_empty(monkeypatch):
+    parser = pip_audit._cli._parser()
+    monkeypatch.setattr(pip_audit._cli, "_parse_args", lambda *a: parser.parse_args([]))
+    args = pip_audit._cli._parse_args(parser, [])
+
+    assert args.extra_vulnerability_services == []

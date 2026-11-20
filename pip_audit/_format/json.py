@@ -82,6 +82,10 @@ class JsonFormat(VulnerabilityFormat):
             vuln_json["aliases"] = list(vuln.aliases)
         if self.output_desc:
             vuln_json["description"] = vuln.description
+        if vuln.sources:
+            # Only present for merged multi-source results; single-source
+            # output is unchanged.
+            vuln_json["sources"] = sorted(vuln.sources)
         return vuln_json
 
     def _format_fix(self, fix_version: fix.FixVersion) -> dict[str, Any]:

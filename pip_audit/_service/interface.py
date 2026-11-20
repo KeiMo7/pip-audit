@@ -5,6 +5,7 @@ of vulnerability information for fully resolved Python packages.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
@@ -13,6 +14,8 @@ from typing import Any, NewType
 
 from packaging.utils import canonicalize_name
 from packaging.version import Version
+
+logger = logging.getLogger(__name__)
 
 VulnerabilityID = NewType("VulnerabilityID", str)
 
@@ -111,6 +114,14 @@ class VulnerabilityResult:
     When the vulnerability was first published.
     """
 
+    sources: frozenset[str] = frozenset()
+    """
+    The names of the vulnerability sources that contributed to this result.
+
+    Empty for results produced by a single-source audit; populated when
+    results from multiple sources have been merged together.
+    """
+
     @classmethod
     def create(
         cls,
@@ -182,6 +193,12 @@ class VulnerabilityService(ABC):
     @staticmethod
     def _parse_rfc3339(dt: str | None) -> datetime | None:
         if dt is None:
+            return None
+
+        # An empty timestamp is a malformed field, not a malformed record:
+        # treat it as missing rather than failing.
+        if not dt.strip():
+            logger.warning("Received an empty timestamp; treating it as missing")
             return None
 
         # NOTE: OSV's schema says timestamps are RFC3339 but strptime
